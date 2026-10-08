@@ -11,12 +11,6 @@
  * and ElementTuple access in a trace entry array. These traces feed
  * Phase 2 (affinity matrix construction).
  *
- * Affinity is accumulated between ElementTuple accesses only; the
- * NeighborTuple entries stay in the trace as position markers so the
- * decay deltas keep tracking the real I/O sequence.  Packing groups
- * elements, and each element's ElementTuple and NeighborTuple are
- * always written to the same page.
- *
  * Algorithm (from plan Section 3.2, Algorithm 1):
  *   1. Assign sequential tuple IDs to all elements/neighbors
  *   2. Sample S queries via reservoir sampling
@@ -33,7 +27,6 @@
 #include "hnsw.h"
 #include "lib/pairingheap.h"
 #include "portability/instr_time.h"
-#include "utils/memutils.h"
 
 /* GUC variables -- defined here, declared extern in hnswaftp.h */
 bool	aftp_enable = false;
@@ -228,11 +221,9 @@ AftpLoadUnvisitedFromMemory(char *base, HnswElement element,
 /* ----------------------------------------------------------------
  * AftpAssignTupleIds
  *
- * Walk the graph->head linked list and assign one global ID space:
- * ElementTuple IDs are [0, N), and NeighborTuple IDs are [N, 2N).
- * Before graph pages are written, blkno and neighborPage are unused. Reuse
- * them for the temporary IDs so disabling AFTP does not enlarge the native
- * HnswElementData allocation or alter its memory-flush threshold.
+ * Walk the graph->head linked list and assign sequential IDs:
+ *   - element->aftp_tuple_id  (ElementTuple ID)
+ *   - element->aftp_ntuple_id (NeighborTuple ID)
  *
  * Output parameters:
  *   *n_elements  = total ElementTuple count
@@ -245,30 +236,18 @@ AftpAssignTupleIds(HnswBuildState *buildstate, int *n_elements,
 {
 	char	   *base = buildstate->hnswarea;
 	HnswElement element = HnswPtrAccess(base, buildstate->graph->head);
-	int			count = 0;
+	int			eid = 0;
+	int			nid = 0;
 
 	while (element != NULL)
 	{
-		if (count == PG_INT32_MAX)
-			elog(ERROR, "AFTP has too many tuples for its global ID space");
-		count++;
+		element->aftp_tuple_id = eid++;
+		element->aftp_ntuple_id = nid++;
 		element = HnswPtrAccess(base, element->next);
 	}
 
-	if (count > PG_INT32_MAX / 2)
-		elog(ERROR, "AFTP has too many tuples for its global ID space");
-
-	element = HnswPtrAccess(base, buildstate->graph->head);
-	for (int eid = 0; eid < count; eid++)
-	{
-		Assert(element != NULL);
-		element->blkno = (BlockNumber) eid;
-		element->neighborPage = (BlockNumber) (count + eid);
-		element = HnswPtrAccess(base, element->next);
-	}
-
-	*n_elements = count;
-	*n_neighbors = count;
+	*n_elements = eid;
+	*n_neighbors = nid;
 }
 
 /* ----------------------------------------------------------------
@@ -278,9 +257,9 @@ AftpAssignTupleIds(HnswBuildState *buildstate, int *n_elements,
  *   - Always runs in memory mode (index == NULL, inMemory == true)
  *   - Records each access as an AftpTraceEntry:
  *       * When popping a candidate c (NeighborTuple read):
- *           (c->neighborPage, AFTP_TUPLE_NEIGHBOR, lc)
+ *           (c->aftp_ntuple_id, AFTP_TUPLE_NEIGHBOR, lc)
  *       * When computing distance for each neighbor e (ElementTuple read):
- *           (e.blkno, AFTP_TUPLE_ELEMENT, lc)
+ *           (e.aftp_tuple_id, AFTP_TUPLE_ELEMENT, lc)
  *   - Returns the result list W for use as entry points in the
  *     next (lower) layer.
  *
@@ -361,7 +340,7 @@ AftpTraceSearchLayer(char *base, HnswQuery *q, List *ep, int ef, int lc,
 					trace->entries = repalloc(trace->entries,
 											  trace->max_entries * sizeof(AftpTraceEntry));
 				}
-				trace->entries[trace->nentries].tuple_id = cElement->neighborPage;
+				trace->entries[trace->nentries].tuple_id = cElement->aftp_ntuple_id;
 				trace->entries[trace->nentries].type = AFTP_TUPLE_NEIGHBOR;
 				trace->entries[trace->nentries].layer = (uint8) lc;
 				trace->nentries++;
@@ -401,7 +380,7 @@ AftpTraceSearchLayer(char *base, HnswQuery *q, List *ep, int ef, int lc,
 							trace->entries = repalloc(trace->entries,
 													  trace->max_entries * sizeof(AftpTraceEntry));
 						}
-						trace->entries[trace->nentries].tuple_id = eElement->blkno;
+						trace->entries[trace->nentries].tuple_id = eElement->aftp_tuple_id;
 						trace->entries[trace->nentries].type = AFTP_TUPLE_ELEMENT;
 						trace->entries[trace->nentries].layer = (uint8) lc;
 						trace->nentries++;
@@ -505,9 +484,8 @@ AftpReservoirSample(char *base, HnswElement head, int n_elements, int S,
  *         result W.
  *   4. Return AftpTraceState containing all traces.
  *
- * Trace state and entry arrays live in the caller's MemoryContext
- * (typically buildstate->aftp_context).  Per-query search allocations live
- * in a reusable scratch context that is reset after each sampled query.
+ * Allocations are done with palloc/palloc0/repalloc, relying on
+ * the caller's MemoryContext (typically buildstate->aftp_context).
  * ---------------------------------------------------------------- */
 
 AftpTraceState *
@@ -520,9 +498,6 @@ AftpCollectTraces(HnswBuildState *buildstate, AftpConfig *config)
 	AftpTraceState *state;
 	HnswElement *samples;
 	int			n_samples;
-	int			ef_search;
-	MemoryContext traceContext = CurrentMemoryContext;
-	MemoryContext queryContext;
 
 	/* Step 1: Assign sequential tuple IDs */
 	AftpAssignTupleIds(buildstate, &n_elements, &n_neighbors);
@@ -565,18 +540,6 @@ AftpCollectTraces(HnswBuildState *buildstate, AftpConfig *config)
 	state->n_elements = n_elements;
 	state->n_neighbors = n_neighbors;
 
-	/*
-	 * Search-layer heaps, visited hashes, candidates, and List cells are only
-	 * needed while processing one sampled query.  Reuse one child context so
-	 * those allocations do not accumulate for the lifetime of the AFTP build.
-	 */
-	queryContext = AllocSetContextCreate(traceContext,
-										 "AFTP trace query scratch context",
-										 ALLOCSET_DEFAULT_SIZES);
-
-	/* This setting is constant for every layer and sampled query. */
-	ef_search = (config->ef_search > 0) ? config->ef_search : 64;
-
 	/* Step 3: Run trace search for each sample query */
 	for (int i = 0; i < n_samples; i++)
 	{
@@ -586,7 +549,6 @@ AftpCollectTraces(HnswBuildState *buildstate, AftpConfig *config)
 		HnswQuery	q;
 		AftpQueryTrace *trace;
 		List	   *ep;
-		MemoryContext oldContext;
 
 		/* Build query from the sample element's vector value */
 		q.value = HnswGetValue(base, sampleElement);
@@ -595,8 +557,7 @@ AftpCollectTraces(HnswBuildState *buildstate, AftpConfig *config)
 		trace = &state->traces[state->n_completed];
 		trace->nentries = 0;
 		trace->max_entries = 4096;
-		trace->entries = MemoryContextAlloc(traceContext,
-										trace->max_entries * sizeof(AftpTraceEntry));
+		trace->entries = palloc(trace->max_entries * sizeof(AftpTraceEntry));
 
 		/* Verify entry point exists */
 		entryElement = HnswPtrAccess(base, buildstate->graph->entryPoint);
@@ -612,9 +573,6 @@ AftpCollectTraces(HnswBuildState *buildstate, AftpConfig *config)
 		/* Determine search start level from the entry point */
 		entryLevel = entryElement->level;
 
-		/* All remaining allocations for this query are temporary. */
-		oldContext = MemoryContextSwitchTo(queryContext);
-
 		/* Create initial entry point candidate */
 		ep = list_make1(HnswEntryCandidate(base, entryElement, &q, NULL,
 										   &buildstate->support, true));
@@ -623,6 +581,9 @@ AftpCollectTraces(HnswBuildState *buildstate, AftpConfig *config)
 		for (int lc = entryLevel; lc >= 0; lc--)
 		{
 			List	   *w;
+			int			ef_search;
+
+			ef_search = (config->ef_search > 0) ? config->ef_search : 64;
 
 			w = AftpTraceSearchLayer(base, &q, ep, ef_search, lc,
 									 &buildstate->support, buildstate->m,
@@ -632,12 +593,9 @@ AftpCollectTraces(HnswBuildState *buildstate, AftpConfig *config)
 			ep = w;
 		}
 
-		MemoryContextSwitchTo(oldContext);
 		state->n_completed++;
-		MemoryContextReset(queryContext);
 	}
 
-	MemoryContextDelete(queryContext);
 	pfree(samples);
 
 	elog(INFO, "AFTP Phase 1: collected traces for %d / %d sample queries",
@@ -703,8 +661,7 @@ AftpFreeTraceState(AftpTraceState *state)
  * Phase 2: Affinity Matrix Construction
  *
  * Builds a sparse affinity matrix from collected query traces.
- * Uses time-decayed co-visit counts within a sliding window; only
- * ElementTuple pairs contribute affinity.
+ * Uses time-decayed co-visit counts within a sliding window.
  *
  * Algorithm (from plan Section 3.3):
  *   1. Process each query trace, accumulating co-visit affinities
@@ -761,180 +718,6 @@ hash_aftp_pair(uint64 key)
 #define SH_DECLARE
 #define SH_DEFINE
 #include "lib/simplehash.h"
-
-/* Keep the estimator small relative to the full pair accumulator. */
-#define AFTP_PAIR_SAMPLE_TARGET UINT64_C(262144)
-#define AFTP_PAIR_SAMPLE_INITIAL_SIZE UINT64_C(16384)
-
-/*
- * Return an upper bound on the number of distinct pairs that can be emitted
- * for this tuple type.  The trace-position bound deliberately ignores type
- * filtering, while the tuple bound is exact for the ID domain.
- */
-static uint64
-AftpPairCountUpperBound(AftpTraceState *traces, int n_tuples, int window)
-{
-	uint64		max_distinct;
-	uint64		upper_bound = 0;
-	int			q;
-
-	max_distinct = ((uint64) n_tuples * (uint64) (n_tuples - 1)) / 2;
-
-	for (q = 0; q < traces->n_completed; q++)
-	{
-		int			n = traces->traces[q].nentries;
-		uint64		span;
-		uint64		trace_pairs;
-
-		if (n <= 1 || window <= 1)
-			continue;
-
-		span = (uint64) Min(window - 1, n - 1);
-		trace_pairs = span * (uint64) n - span * (span + 1) / 2;
-
-		/* Saturate at the tighter tuple-domain bound without overflowing. */
-		if (trace_pairs >= max_distinct - upper_bound)
-			return max_distinct;
-
-		upper_bound += trace_pairs;
-	}
-
-	return upper_bound;
-}
-
-/*
- * Estimate the number of unique pairs with deterministic hash sampling.
- *
- * The sampling divisor is selected from a cheap upper bound and is always a
- * power of two.  Consequently every distinct pair is selected with the same
- * probability, regardless of how often it occurs in the traces.  The pilot
- * stores keys only; it does not aggregate affinity and is destroyed before
- * the one full formal aggregation pass.
- */
-static uint64
-AftpEstimatePairCount(AftpTraceState *traces, int n_tuples, int window,
-					  MemoryContext pair_context,
-					  uint32 *sampled_pairs, uint64 *sample_divisor,
-					  uint64 *pair_upper_bound)
-{
-	aftppair_hash *sample_hash;
-	uint64		upper_bound;
-	uint64		estimable_upper;
-	uint64		expected_sample;
-	uint64		divisor = 1;
-	uint64		estimate;
-	uint32		sample_mask;
-	uint32		initial_size;
-	int			sample_shift = 0;
-	int			q;
-
-	upper_bound = AftpPairCountUpperBound(traces, n_tuples, window);
-	estimable_upper = Min(upper_bound, (uint64) PG_UINT32_MAX);
-	expected_sample = estimable_upper;
-
-	while (expected_sample > AFTP_PAIR_SAMPLE_TARGET && sample_shift < 31)
-	{
-		expected_sample = (expected_sample + 1) / 2;
-		sample_shift++;
-		divisor <<= 1;
-	}
-
-	/* Do not preallocate the type-agnostic upper bound for sparse types. */
-	initial_size = (uint32) Max(UINT64_C(1),
-								  Min(expected_sample,
-									  AFTP_PAIR_SAMPLE_INITIAL_SIZE));
-	sample_mask = (uint32) (divisor - 1);
-	sample_hash = aftppair_create(pair_context, initial_size, NULL);
-
-	for (q = 0; q < traces->n_completed; q++)
-	{
-		AftpQueryTrace *trace = &traces->traces[q];
-		int			n = trace->nentries;
-		AftpTraceEntry *entries = trace->entries;
-		int			i;
-
-		for (i = 0; i < n; i++)
-		{
-			AftpTraceEntry *ei = &entries[i];
-			int			max_j;
-			uint32		 ti;
-			int			j;
-
-			/* Only E<->E pairs contribute; N entries are position markers. */
-			if (ei->type != AFTP_TUPLE_ELEMENT)
-				continue;
-
-			max_j = (window < n - i) ? i + window : n;
-			ti = ei->tuple_id;
-
-			for (j = i + 1; j < max_j; j++)
-			{
-				AftpTraceEntry *ej = &entries[j];
-				uint32		 tj;
-				uint32		 id1;
-				uint32		 id2;
-				uint64		 pair_key;
-				uint32		 pair_hash;
-				bool		 found;
-
-				if (ej->type != AFTP_TUPLE_ELEMENT)
-					continue;
-
-				tj = ej->tuple_id;
-				if (ti == tj)
-					continue;
-
-				if (ti < tj)
-				{
-					id1 = ti;
-					id2 = tj;
-				}
-				else
-				{
-					id1 = tj;
-					id2 = ti;
-				}
-
-				if (id1 >= (uint32) n_tuples || id2 >= (uint32) n_tuples)
-					elog(ERROR, "AFTP Phase 2: tuple_id out of range "
-						 "(id1=%u, id2=%u, n_tuples=%d)",
-						 id1, id2, n_tuples);
-
-				pair_key = ((uint64) id1 << 32) | (uint64) id2;
-				pair_hash = hash_aftp_pair(pair_key);
-				if ((pair_hash & sample_mask) != 0)
-					continue;
-
-				(void) aftppair_insert_hash(sample_hash, pair_key,
-										pair_hash, &found);
-			}
-		}
-	}
-
-	*sampled_pairs = sample_hash->members;
-	*sample_divisor = divisor;
-	*pair_upper_bound = upper_bound;
-
-	if (sample_shift == 0)
-		estimate = (uint64) sample_hash->members;
-	else if ((uint64) sample_hash->members > PG_UINT64_MAX / divisor)
-		estimate = PG_UINT64_MAX;
-	else
-		estimate = (uint64) sample_hash->members * divisor;
-
-	aftppair_destroy(sample_hash);
-
-	/* Keep tiny/empty estimates cheap while avoiding pathological starts. */
-	if (upper_bound == 0)
-		estimate = 1;
-	else
-	{
-		estimate = Max(estimate, Min(upper_bound, UINT64_C(1024)));
-		estimate = Min(estimate, upper_bound);
-	}
-
-	return Min(estimate, (uint64) PG_UINT32_MAX);
-}
 
 /*
  * Compare affinity entries by retention quality.
@@ -1068,40 +851,32 @@ AftpAffinityHeapOffer(AftpAffinityRow *row, uint32 capacity,
  * Build a sparse affinity matrix from collected query traces.
  *
  * For each trace, within window W, compute exp(-delta / lambda)
- * weighted co-visit scores for ElementTuple pairs, accumulate in a
- * hash table, then extract top-K_affinity per tuple into the result
- * matrix.  NeighborTuple trace entries only occupy positions; their
- * pairs are skipped so the decay deltas keep tracking the real I/O
- * sequence.
+ * weighted co-visit scores, accumulate in a hash table, then
+ * extract top-K_affinity per tuple into the result matrix.
  *
  * Parameters:
  *   traces       - Collected trace state from Phase 1
- *   n_tuples     - Number of ElementTuples; rows and weights cover
- *                  the element ID space [0, n_tuples) only
+ *   n_tuples     - Total number of tuples (elements or neighbors)
  *   top_affinity - K: max non-zero entries per row
  *   window       - W: co-visit window in trace positions
  *   decay_lambda - lambda: time-decay scaling (0 = auto = W/3)
+ *   target_type  - AFTP_TUPLE_ELEMENT or AFTP_TUPLE_NEIGHBOR
+ *
  * Returns:
  *   Allocated AftpAffinityMatrix, or NULL on invalid input.
  * ---------------------------------------------------------------- */
 AftpAffinityMatrix *
 AftpBuildAffinityMatrix(AftpTraceState *traces, int n_tuples,
-						int top_affinity, int window, double decay_lambda)
+						int top_affinity, int window, double decay_lambda,
+						uint8 target_type)
 {
 	AftpAffinityMatrix *A;
 	aftppair_hash *pairhash;
-	MemoryContext pair_context;
-	volatile uint64 estimated_pairs = 0;
-	uint64		sample_divisor;
-	uint64		pair_upper_bound;
-	uint32		sampled_pairs;
+	uint64		estimated_pairs;
 	int			effective_window;
 	float		effective_lambda;
-	float	   *decay_lookup;
 	uint32		heap_capacity;
-	volatile uint32 hash_members = 0;
-	int			delta;
-	int			i;
+	uint32		hash_members;
 
 	/* ---- Validate inputs ---- */
 	if (traces == NULL || traces->n_completed <= 0 || n_tuples <= 0)
@@ -1111,9 +886,18 @@ AftpBuildAffinityMatrix(AftpTraceState *traces, int n_tuples,
 		return NULL;
 	}
 
-	if (n_tuples != traces->n_elements)
-		elog(ERROR, "AFTP Phase 2: n_tuples=%d does not match element "
-			 "domain size %d", n_tuples, traces->n_elements);
+	/*
+	 * Cross-validate n_tuples against trace metadata to prevent
+	 * out-of-bounds array access when tuple_ids are used as indices.
+	 */
+	if (target_type == AFTP_TUPLE_ELEMENT && n_tuples != traces->n_elements)
+		elog(ERROR, "AFTP Phase 2: n_tuples=%d does not match "
+			 "traces->n_elements=%d for element type",
+			 n_tuples, traces->n_elements);
+	if (target_type == AFTP_TUPLE_NEIGHBOR && n_tuples != traces->n_neighbors)
+		elog(ERROR, "AFTP Phase 2: n_tuples=%d does not match "
+			 "traces->n_neighbors=%d for neighbor type",
+			 n_tuples, traces->n_neighbors);
 
 	if (top_affinity <= 0)
 	{
@@ -1141,13 +925,10 @@ AftpBuildAffinityMatrix(AftpTraceState *traces, int n_tuples,
 	/* Guard against zero or denormal lambda → division by zero in expf(-delta/lambda) */
 	if (effective_lambda < FLT_MIN)
 		effective_lambda = (float) effective_window / 3.0f;
-	if ((Size) effective_window > MaxAllocSize / sizeof(float))
-		elog(ERROR, "AFTP Phase 2: decay lookup allocation is too large "
-			 "(W=%d)", effective_window);
 
-	elog(INFO, "AFTP Phase 2: n_elements=%d, K=%d, W=%d, lambda=%.2f, "
-		 "type=element-pair", n_tuples, top_affinity, effective_window,
-		 (double) effective_lambda);
+	elog(INFO, "AFTP Phase 2: n_tuples=%d, K=%d, W=%d, lambda=%.2f, type=%s",
+		 n_tuples, top_affinity, effective_window, (double) effective_lambda,
+		 target_type == AFTP_TUPLE_ELEMENT ? "element" : "neighbor");
 
 	/* ---- Step 1: Allocate result matrix ---- */
 	A = (AftpAffinityMatrix *) palloc0(sizeof(AftpAffinityMatrix));
@@ -1156,73 +937,54 @@ AftpBuildAffinityMatrix(AftpTraceState *traces, int n_tuples,
 	A->rows = (AftpAffinityRow *) palloc0(n_tuples * sizeof(AftpAffinityRow));
 	A->point_weights = (float *) palloc0(n_tuples * sizeof(float));
 
+	/* ---- Step 2: Accumulate co-visit pairs in hash table ---- */
+
 	/*
-	 * Keep all pair-accumulator and pilot allocations in a per-call child
-	 * context.  The result matrix above and its lazily allocated row heaps
-	 * remain in the caller's current (parent) context.
+	 * Estimate initial hash size.  Expected unique pairs is roughly
+	 * n_tuples * avg_degree / 2.  Start with a generous estimate to
+	 * minimize resizing.
 	 */
-	pair_context = AllocSetContextCreate(CurrentMemoryContext,
-									 "AFTP element pair hash context",
-									 ALLOCSET_DEFAULT_SIZES);
+	estimated_pairs = Max(UINT64_C(1024),
+						  (uint64) n_tuples * (uint64) top_affinity / 2);
+	if (estimated_pairs > PG_UINT32_MAX)
+		estimated_pairs = PG_UINT32_MAX;
+	pairhash = aftppair_create(CurrentMemoryContext,
+							   (uint32) estimated_pairs, NULL);
 
-	PG_TRY();
+	/*
+	 * Process each query trace.  For each pair of same-type entries
+	 * within the sliding window W, compute a time-decayed affinity
+	 * contribution and add it to the symmetric pair key in the hash.
+	 */
+	for (int q = 0; q < traces->n_completed; q++)
 	{
-		int			q;
+		AftpQueryTrace *trace = &traces->traces[q];
+		int			n = trace->nentries;
+		AftpTraceEntry *entries = trace->entries;
 
-		/* ---- Step 2: Estimate pair count and precompute decay values ---- */
-		estimated_pairs = AftpEstimatePairCount(traces, n_tuples,
-											effective_window,
-											pair_context, &sampled_pairs,
-											&sample_divisor,
-											&pair_upper_bound);
-
-		elog(INFO, "AFTP Phase 2: type=element-pair, estimated_pairs="
-			 UINT64_FORMAT ", sampled_pairs=%u, sample_rate=1/" UINT64_FORMAT
-			 ", pair_upper_bound=" UINT64_FORMAT,
-			 estimated_pairs, sampled_pairs, sample_divisor, pair_upper_bound);
-
-		decay_lookup = (float *) MemoryContextAlloc(pair_context,
-												(Size) effective_window * sizeof(float));
-		decay_lookup[0] = 1.0f;
-		for (delta = 1; delta < effective_window; delta++)
-			decay_lookup[delta] = expf(-(float) delta / effective_lambda);
-
-		pairhash = aftppair_create(pair_context,
-								   (uint32) estimated_pairs, NULL);
-
-		/*
-		 * Formal aggregation pass: process every trace exactly once.  Only
-		 * E<->E pairs within W contribute affinity; N entries are position
-		 * markers and use no precomputed delta value.
-		 */
-		for (q = 0; q < traces->n_completed; q++)
+		for (int i = 0; i < n; i++)
 		{
-			AftpQueryTrace *trace = &traces->traces[q];
-			int			n = trace->nentries;
-			AftpTraceEntry *entries = trace->entries;
+			AftpTraceEntry *ei = &entries[i];
 
-			for (i = 0; i < n; i++)
+			if (ei->type != target_type)
+				continue;
+
 			{
-				AftpTraceEntry *ei = &entries[i];
-				int			max_j = (effective_window < n - i) ?
-					i + effective_window : n;
+				int			max_j = Min(i + effective_window, n);
 				uint32		ti = ei->tuple_id;
-				int			j;
 
-				if (ei->type != AFTP_TUPLE_ELEMENT)
-					continue;
-
-				for (j = i + 1; j < max_j; j++)
+				for (int j = i + 1; j < max_j; j++)
 				{
 					AftpTraceEntry *ej = &entries[j];
 					uint32		tj;
 					uint32		id1;
 					uint32		id2;
 					uint64		pair_key;
+					float		decay;
 					AftpPairEntry *h_entry;
 					bool		found;
 
-					if (ej->type != AFTP_TUPLE_ELEMENT)
+					if (ej->type != target_type)
 						continue;
 
 					tj = ej->tuple_id;
@@ -1245,66 +1007,60 @@ AftpBuildAffinityMatrix(AftpTraceState *traces, int n_tuples,
 						id2 = ti;
 					}
 
-					/* Bounds check: id1, id2 index result arrays below. */
-					if (id1 >= (uint32) n_tuples || id2 >= (uint32) n_tuples)
-						elog(ERROR, "AFTP Phase 2: tuple_id out of range "
-							 "(id1=%u, id2=%u, n_tuples=%d)",
-							 id1, id2, n_tuples);
-
 					pair_key = ((uint64) id1 << 32) | (uint64) id2;
+
+						/* Bounds check: id1, id2 are used as array indices below */
+						if (id1 >= (uint32) n_tuples || id2 >= (uint32) n_tuples)
+							elog(ERROR, "AFTP Phase 2: tuple_id out of range "
+								 "(id1=%u, id2=%u, n_tuples=%d)",
+								 id1, id2, n_tuples);
+
+						decay = expf(-(float) (j - i) / effective_lambda);
+
 					h_entry = aftppair_insert(pairhash, pair_key, &found);
 					if (found)
-						h_entry->affinity += decay_lookup[j - i];
+						h_entry->affinity += decay;
 					else
-						h_entry->affinity = decay_lookup[j - i];
+						h_entry->affinity = decay;
 				}
 			}
 		}
-
-		hash_members = pairhash->members;
-
-		/* ---- Step 3: Initialize bounded per-tuple heaps ---- */
-		for (i = 0; i < n_tuples; i++)
-		{
-			A->rows[i].tuple_id = (uint32) i;
-			A->rows[i].max_entries = (uint32) top_affinity;
-			A->rows[i].n_entries = 0;
-			A->rows[i].entries = NULL;
-		}
-
-		/* ---- Step 4: Accumulate all weights and retain each row's top-K ---- */
-		{
-			aftppair_iterator iter;
-			AftpPairEntry *e;
-
-			aftppair_start_iterate(pairhash, &iter);
-			while ((e = aftppair_iterate(pairhash, &iter)) != NULL)
-			{
-				uint32		id1 = (uint32) (e->pair_key >> 32);
-				uint32		id2 = (uint32) (e->pair_key & 0xFFFFFFFF);
-				float		aff = e->affinity;
-
-				/* Sum ALL affinities, not just the retained top-K. */
-				A->point_weights[id1] += aff;
-				A->point_weights[id2] += aff;
-
-				AftpAffinityHeapOffer(&A->rows[id1], heap_capacity, id2, aff);
-				AftpAffinityHeapOffer(&A->rows[id2], heap_capacity, id1, aff);
-			}
-		}
 	}
-	PG_CATCH();
+
+	hash_members = pairhash->members;
+
+	/* ---- Step 3: Initialize bounded per-tuple heaps ---- */
+	for (int i = 0; i < n_tuples; i++)
 	{
-		MemoryContextDelete(pair_context);
-		PG_RE_THROW();
+		A->rows[i].tuple_id = (uint32) i;
+		A->rows[i].max_entries = (uint32) top_affinity;
+		A->rows[i].n_entries = 0;
+		A->rows[i].entries = NULL;
 	}
-	PG_END_TRY();
 
-	/* The result matrix is in the caller context; release pair memory now. */
-	MemoryContextDelete(pair_context);
+	/* ---- Step 4: Accumulate all weights and retain each row's top-K ---- */
+	{
+		aftppair_iterator iter;
+		AftpPairEntry *e;
+
+		aftppair_start_iterate(pairhash, &iter);
+		while ((e = aftppair_iterate(pairhash, &iter)) != NULL)
+		{
+			uint32		id1 = (uint32) (e->pair_key >> 32);
+			uint32		id2 = (uint32) (e->pair_key & 0xFFFFFFFF);
+			float		aff = e->affinity;
+
+			/* Accumulate point weight (sum of ALL affinities, not just top-K) */
+			A->point_weights[id1] += aff;
+			A->point_weights[id2] += aff;
+
+			AftpAffinityHeapOffer(&A->rows[id1], heap_capacity, id2, aff);
+			AftpAffinityHeapOffer(&A->rows[id2], heap_capacity, id1, aff);
+		}
+	}
 
 	/* ---- Step 5: Sort retained heap entries into final row order ---- */
-	for (i = 0; i < n_tuples; i++)
+	for (int i = 0; i < n_tuples; i++)
 	{
 		AftpAffinityRow *row = &A->rows[i];
 
@@ -1313,9 +1069,12 @@ AftpBuildAffinityMatrix(AftpTraceState *traces, int n_tuples,
 				  compare_affinity_desc);
 	}
 
-	elog(INFO, "AFTP Phase 2: element affinity matrix built (n_elements=%d, "
-		 "K=%d, estimated_pairs=" UINT64_FORMAT ", unique_pairs=%u)",
-		 n_tuples, top_affinity, estimated_pairs, (uint32) hash_members);
+	/* ---- Step 6: Free the global accumulator ---- */
+	aftppair_destroy(pairhash);
+
+	elog(INFO, "AFTP Phase 2: affinity matrix built (n_tuples=%d, "
+		 "K=%d, unique_pairs=%u)",
+		 n_tuples, top_affinity, hash_members);
 
 	return A;
 }
@@ -1488,13 +1247,6 @@ LookupAffinity(AftpAffinityMatrix *A, uint32 t_i, uint32 t_j)
 	return 0.0f;
 }
 
-/* Top-K retention can be asymmetric; sum both retained directions. */
-static float
-LookupPairAffinity(AftpAffinityMatrix *A, uint32 t_i, uint32 t_j)
-{
-	return LookupAffinity(A, t_i, t_j) + LookupAffinity(A, t_j, t_i);
-}
-
 /* ----------------------------------------------------------------
  * softmax_sample (static helper)
  *
@@ -1507,7 +1259,6 @@ static int
 softmax_sample(AftpWeightedTuple *candidates, int n_cand, float temperature)
 {
 	float		total = 0.0f;
-	float		max_weight;
 	float	   *probs;
 	float		r;
 	float		accum = 0.0f;
@@ -1518,13 +1269,10 @@ softmax_sample(AftpWeightedTuple *candidates, int n_cand, float temperature)
 		temperature = 1.0f;
 
 	probs = palloc(n_cand * sizeof(float));
-	max_weight = candidates[0].weight;
-	for (int i = 1; i < n_cand; i++)
-		max_weight = Max(max_weight, candidates[i].weight);
 
 	for (int i = 0; i < n_cand; i++)
 	{
-		probs[i] = expf((candidates[i].weight - max_weight) / temperature);
+		probs[i] = expf(candidates[i].weight / temperature);
 		total += probs[i];
 	}
 
@@ -1550,126 +1298,59 @@ softmax_sample(AftpWeightedTuple *candidates, int n_cand, float temperature)
 	return n_cand - 1;
 }
 
-/*
- * Return exact physical costs per element.  An element's ElementTuple and
- * NeighborTuple always land on the same page, so one element consumes both
- * MAXALIGN'd tuples plus two line pointers.  Modeling bytes, rather than an
- * average tuple count, is required because tuple sizes vary by vector width
- * and NeighborTuple level.
- */
-static Size *
-AftpComputeTupleSizes(HnswBuildState *buildstate, int n_elements,
-					  Size *page_capacity, int *nominal_tuples_per_page)
+/* ----------------------------------------------------------------
+ * AftpComputePageCapacity
+ *
+ * Compute the number of ElementTuples or NeighborTuples that fit in
+ * one 8KB PostgreSQL page (BLCKSZ).
+ *
+ * Walks the graph->head linked list, computes the average tuple size
+ * for the requested tuple type, and returns floor(BLCKSZ / avg_size).
+ * ---------------------------------------------------------------- */
+int
+AftpComputePageCapacity(HnswBuildState *buildstate, bool is_element_tuple)
 {
 	char	   *base = buildstate->hnswarea;
 	HnswElement element;
-	Size	   *tuple_sizes;
-	Size		total_size = 0;
-	int			n_tuples = n_elements;
+	double		total_size = 0.0;
+	int			count = 0;
+	int			capacity;
 
-	*page_capacity = HNSW_MAX_SIZE + sizeof(ItemIdData);
-	tuple_sizes = palloc((Size) n_tuples * sizeof(Size));
 	element = HnswPtrAccess(base, buildstate->graph->head);
 
 	while (element != NULL)
 	{
-		uint32		eid = element->blkno;
-		Pointer		value = HnswPtrAccess(base, element->value);
-		Size		etup_size = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(value));
-		Size		ntup_size = HNSW_NEIGHBOR_TUPLE_SIZE(element->level,
-														buildstate->m);
-
-		if (eid >= (uint32) n_elements)
-			elog(ERROR, "AFTP Phase 3: invalid element tuple ID");
-
-		/* The element tuple and its neighbor tuple share one page. */
-		tuple_sizes[eid] = etup_size + ntup_size + 2 * sizeof(ItemIdData);
-		if (tuple_sizes[eid] > *page_capacity)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("element %u and its neighbor tuple exceed a page",
-							eid),
-					 errdetail("Element tuple (%zu bytes) plus neighbor tuple "
-							   "(%zu bytes) need %zu bytes with line pointers, "
-							   "but a page holds %zu.",
-							   etup_size, ntup_size, tuple_sizes[eid],
-							   *page_capacity)));
-		if (total_size > MaxAllocSize - tuple_sizes[eid])
-			elog(ERROR, "AFTP Phase 3: total tuple size is too large");
-		total_size += tuple_sizes[eid];
+		if (is_element_tuple)
+		{
+			total_size += HNSW_ELEMENT_TUPLE_SIZE(buildstate->dimensions *
+												  sizeof(float));
+		}
+		else
+		{
+			total_size += HNSW_NEIGHBOR_TUPLE_SIZE(element->level,
+												   buildstate->m);
+		}
+		count++;
 		element = HnswPtrAccess(base, element->next);
 	}
 
-	*nominal_tuples_per_page = Max(1,
-		(int) (((uint64) *page_capacity * (uint64) n_tuples) /
-				 Max((uint64) total_size, UINT64_C(1))));
-	return tuple_sizes;
-}
-
-static AftpPage *
-AftpCreatePage(int page_id, Size capacity_bytes)
-{
-	AftpPage   *page = palloc0(sizeof(AftpPage));
-
-	page->page_id = page_id;
-	page->tuple_capacity = 8;
-	page->capacity_bytes = capacity_bytes;
-	page->tuple_ids = palloc((Size) page->tuple_capacity * sizeof(uint32));
-	return page;
-}
-
-static bool
-AftpPageCanFit(AftpPage *page, Size tuple_size)
-{
-	return tuple_size <= page->capacity_bytes - page->used_bytes;
-}
-
-static void
-AftpPageAddTuple(AftpPage *page, uint32 tuple_id, Size tuple_size)
-{
-	if (!AftpPageCanFit(page, tuple_size))
-		elog(ERROR, "AFTP page %d does not have space for tuple %u",
-			 page->page_id, tuple_id);
-
-	if (page->n_tuples == page->tuple_capacity)
+	if (count == 0)
 	{
-		int			new_capacity;
-
-		if (page->tuple_capacity > PG_INT32_MAX / 2 ||
-			(Size) page->tuple_capacity * 2 > MaxAllocSize / sizeof(uint32))
-			elog(ERROR, "AFTP page tuple array is too large");
-		new_capacity = page->tuple_capacity * 2;
-		page->tuple_ids = repalloc(page->tuple_ids,
-									 (Size) new_capacity * sizeof(uint32));
-		page->tuple_capacity = new_capacity;
+		/* Fallback: use a single-element estimate */
+		if (is_element_tuple)
+			total_size = HNSW_ELEMENT_TUPLE_SIZE(buildstate->dimensions *
+												 sizeof(float));
+		else
+			total_size = HNSW_NEIGHBOR_TUPLE_SIZE(0, buildstate->m);
+		count = 1;
 	}
 
-	page->tuple_ids[page->n_tuples++] = tuple_id;
-	page->used_bytes += tuple_size;
-}
+	capacity = (int) (BLCKSZ / (total_size / count));
 
-static void
-AftpPageRemoveTuple(AftpPage *page, uint32 tuple_id, Size tuple_size)
-{
-	int			idx = -1;
+	if (capacity < 1)
+		capacity = 1;
 
-	for (int i = 0; i < page->n_tuples; i++)
-	{
-		if (page->tuple_ids[i] == tuple_id)
-		{
-			idx = i;
-			break;
-		}
-	}
-
-	if (idx < 0)
-		elog(ERROR, "AFTP tuple %u is missing from page %d",
-			 tuple_id, page->page_id);
-	for (int i = idx; i < page->n_tuples - 1; i++)
-		page->tuple_ids[i] = page->tuple_ids[i + 1];
-	page->n_tuples--;
-	Assert(page->used_bytes >= tuple_size);
-	page->used_bytes -= tuple_size;
+	return capacity;
 }
 
 /* ----------------------------------------------------------------
@@ -1682,8 +1363,8 @@ AftpPageRemoveTuple(AftpPage *page, uint32 tuple_id, Size tuple_size)
  *   1. Sort all tuples by point_weight descending
  *      and link their sorted positions in an unplaced list.
  *   2. While unplaced tuples remain:
- *      a. If the max remaining weight <= 0, byte-pack the remaining
- *         zero-affinity tuples without scoring and stop.
+ *      a. If the max remaining weight <= 0, place each remaining
+ *         tuple in its own singleton page and stop.
  *      b. Select seed: either deterministic (first unplaced = max
  *         weight) or softmax-sampled from top seed_softmax candidates.
  *      c. Create a new page with the seed.
@@ -1695,8 +1376,7 @@ AftpPageRemoveTuple(AftpPage *page, uint32 tuple_id, Size tuple_size)
  *
  * Parameters:
  *   A               - Affinity matrix (from Phase 2)
- *   tuple_sizes     - Exact physical size of every tuple, including ItemId
- *   page_capacity   - Exact bytes available in one initialized HNSW page
+ *   K               - Page capacity (max tuples per page)
  *   seed_softmax    - Softmax window for seed selection
  *                     0 = always pick max-weight unplaced tuple
  *   out_page_assignment - Output: page_assignment[t] = page_id
@@ -1704,8 +1384,7 @@ AftpPageRemoveTuple(AftpPage *page, uint32 tuple_id, Size tuple_size)
  *   out_n_pages     - Output: total number of pages
  * ---------------------------------------------------------------- */
 void
-AftpGreedyPacking(AftpAffinityMatrix *A, Size *tuple_sizes,
-				  Size page_capacity, int seed_softmax,
+AftpGreedyPacking(AftpAffinityMatrix *A, int K, int seed_softmax,
 				  int **out_page_assignment, AftpPage ***out_pages,
 				  int *out_n_pages)
 {
@@ -1716,8 +1395,6 @@ AftpGreedyPacking(AftpAffinityMatrix *A, Size *tuple_sizes,
 	AftpPage  **pages;
 	int		   *page_assignment;
 	int			pages_capacity = 64;
-	int			nominal_K;
-	uint64		total_size = 0;
 
 	if (N == 0)
 	{
@@ -1726,22 +1403,14 @@ AftpGreedyPacking(AftpAffinityMatrix *A, Size *tuple_sizes,
 		*out_n_pages = 0;
 		return;
 	}
-	if (tuple_sizes == NULL || page_capacity == 0)
-		elog(ERROR, "AFTP Phase 3: invalid byte-capacity input");
-	for (uint32 i = 0; i < N; i++)
-	{
-		if (tuple_sizes[i] == 0 || tuple_sizes[i] > page_capacity)
-			elog(ERROR, "AFTP Phase 3: tuple %u has invalid physical size %zu",
-				 i, tuple_sizes[i]);
-		total_size += tuple_sizes[i];
-	}
-	nominal_K = Max(1, (int) (((uint64) page_capacity * N) /
-								 Max(total_size, UINT64_C(1))));
+	if (K <= 0)
+		elog(ERROR, "AFTP Phase 3: page capacity must be positive (K=%d)", K);
 	if ((Size) N > MaxAllocSize / sizeof(AftpWeightedTuple) ||
 		(Size) N > MaxAllocSize / sizeof(uint32) ||
-		(Size) N > MaxAllocSize / sizeof(int))
+		(Size) N > MaxAllocSize / sizeof(int) ||
+		(Size) K > MaxAllocSize / sizeof(uint32))
 		elog(ERROR, "AFTP Phase 3: packing allocation is too large "
-			 "(n_tuples=%u)", N);
+			 "(n_tuples=%u, K=%d)", N, K);
 
 	/* ---- Step 1: Sort all tuples by point_weight descending ---- */
 	sorted = palloc(N * sizeof(AftpWeightedTuple));
@@ -1785,9 +1454,8 @@ AftpGreedyPacking(AftpAffinityMatrix *A, Size *tuple_sizes,
 
 		/* --------------------------------------------------------
 		 * Check if all remaining tuples have zero/negative affinity.
-		 * If so, byte-pack them without affinity scoring.  Grouping tuples
-		 * with no retained affinity cannot reduce LS and avoids pathological
-		 * one-tuple physical pages.
+		 * If so, place each in its own singleton page and exit the
+		 * main loop — Section 3.4 Step 3.
 		 * -------------------------------------------------------- */
 		{
 			uint32		first_unplaced = unplaced.head;
@@ -1795,32 +1463,28 @@ AftpGreedyPacking(AftpAffinityMatrix *A, Size *tuple_sizes,
 			if (first_unplaced != AFTP_NO_POSITION &&
 				A->point_weights[sorted[first_unplaced].tuple_id] <= 0.0f)
 			{
-				while (unplaced.count > 0)
+				for (uint32 i = 0; i < N; i++)
 				{
-					AftpPage  *zpage = AftpCreatePage(n_pages, page_capacity);
-					uint32		position = unplaced.head;
+					uint32		position = unplaced.tuple_positions[i];
 
-					while (position != AFTP_NO_POSITION)
+					if (position != AFTP_NO_POSITION)
 					{
-						uint32		next = unplaced.next[position];
-						uint32		tuple_id = sorted[position].tuple_id;
+						AftpPage *zpage;
 
-						if (AftpPageCanFit(zpage, tuple_sizes[tuple_id]))
-						{
-							AftpPageAddTuple(zpage, tuple_id,
-											 tuple_sizes[tuple_id]);
-							AftpRemoveUnplaced(&unplaced, sorted, position);
-						}
-						position = next;
+						zpage = palloc(sizeof(AftpPage));
+						zpage->page_id = n_pages;
+						zpage->n_tuples = 1;
+						zpage->capacity = K;
+						zpage->tuple_ids = palloc(sizeof(uint32));
+						zpage->tuple_ids[0] = i;
+
+						AftpEnsurePageCapacity(&pages, &pages_capacity,
+										   n_pages + 1);
+						pages[n_pages] = zpage;
+						page_assignment[i] = n_pages;
+						n_pages++;
+						AftpRemoveUnplaced(&unplaced, sorted, position);
 					}
-
-					Assert(zpage->n_tuples > 0);
-					AftpEnsurePageCapacity(&pages, &pages_capacity,
-									   n_pages + 1);
-					pages[n_pages] = zpage;
-					for (int m = 0; m < zpage->n_tuples; m++)
-						page_assignment[zpage->tuple_ids[m]] = n_pages;
-					n_pages++;
 				}
 				Assert(unplaced.count == 0);
 				break;
@@ -1862,20 +1526,22 @@ AftpGreedyPacking(AftpAffinityMatrix *A, Size *tuple_sizes,
 			}
 
 			/* Create new page with seed (§3.4 Step 2b) */
-			page = AftpCreatePage(n_pages, page_capacity);
-			AftpPageAddTuple(page, seed_id, tuple_sizes[seed_id]);
+			page = palloc(sizeof(AftpPage));
+			page->page_id = n_pages;
+			page->n_tuples = 1;
+			page->capacity = K;
+			page->tuple_ids = palloc(K * sizeof(uint32));
+			page->tuple_ids[0] = seed_id;
 			AftpRemoveUnplaced(&unplaced, sorted,
 							   unplaced.tuple_positions[seed_id]);
 		}
 
 		/* === Grow Page (§3.4 Step 2c) === */
-		while (unplaced.count > 0)
+		while (page->n_tuples < K && unplaced.count > 0)
 		{
-			int			base_limit = Max(nominal_K,
-									 (int) sqrt((double) unplaced.count));
+			int			base_limit = Max(K, (int) sqrt((double) unplaced.count));
 
-			scan_limit = (int) Min((int64) 10 * nominal_K,
-								 (int64) base_limit);
+			scan_limit = (int) Min((int64) 10 * K, (int64) base_limit);
 
 			best_score = 0.0f;
 			best_candidate_position = AFTP_NO_POSITION;
@@ -1892,8 +1558,6 @@ AftpGreedyPacking(AftpAffinityMatrix *A, Size *tuple_sizes,
 
 					position = unplaced.next[candidate_position];
 					scanned++;
-					if (!AftpPageCanFit(page, tuple_sizes[cand_id]))
-						continue;
 
 					if (best_score > 0.0f &&
 						A->point_weights[cand_id] == 0.0f)
@@ -1911,7 +1575,7 @@ AftpGreedyPacking(AftpAffinityMatrix *A, Size *tuple_sizes,
 
 						for (int m = 0; m < page->n_tuples; m++)
 						{
-							score += LookupPairAffinity(A, cand_id,
+							score += LookupAffinity(A, cand_id,
 													page->tuple_ids[m]);
 						}
 
@@ -1932,7 +1596,7 @@ AftpGreedyPacking(AftpAffinityMatrix *A, Size *tuple_sizes,
 			{
 				uint32		cand_id = sorted[best_candidate_position].tuple_id;
 
-				AftpPageAddTuple(page, cand_id, tuple_sizes[cand_id]);
+				page->tuple_ids[page->n_tuples++] = cand_id;
 				AftpRemoveUnplaced(&unplaced, sorted,
 								   best_candidate_position);
 			}
@@ -2026,6 +1690,47 @@ AftpComputeLocalityScore(AftpAffinityMatrix *A, int *P, int n_tuples)
  * ================================================================== */
 
 /* ----------------------------------------------------------------
+ * Page helper: remove a tuple from a page's tuple_ids array.
+ * Shifts subsequent elements down to close the gap.
+ * ---------------------------------------------------------------- */
+static void
+page_remove_tuple(AftpPage *page, uint32 tuple_id)
+{
+	int			idx = -1;
+
+	for (int i = 0; i < page->n_tuples; i++)
+	{
+		if (page->tuple_ids[i] == tuple_id)
+		{
+			idx = i;
+			break;
+		}
+	}
+
+	if (idx < 0)
+		return;					/* not found */
+
+	for (int i = idx; i < page->n_tuples - 1; i++)
+		page->tuple_ids[i] = page->tuple_ids[i + 1];
+
+	page->n_tuples--;
+}
+
+/* ----------------------------------------------------------------
+ * Page helper: add a tuple to a page's tuple_ids array.
+ * Requires page->n_tuples < page->capacity (caller must check).
+ * ---------------------------------------------------------------- */
+static void
+page_add_tuple(AftpPage *page, uint32 tuple_id)
+{
+	if (page->n_tuples >= page->capacity)
+		elog(ERROR, "AFTP Phase 4: page %d is full (n_tuples=%d, capacity=%d)",
+			 page->page_id, page->n_tuples, page->capacity);
+
+	page->tuple_ids[page->n_tuples++] = tuple_id;
+}
+
+/* ----------------------------------------------------------------
  * AftpBuildInvertedIndex
  *
  * Build a page -> external-tuple reverse index from the affinity
@@ -2047,9 +1752,9 @@ static AftpInvertedIndex *
 AftpBuildInvertedIndex(AftpAffinityMatrix *A, int *P, int n_tuples,
 					   int n_pages, int top_affinity)
 {
-	uint32	   *counts;
+	uint16	   *counts;
 	uint32	  **page_partners;
-	uint32	   *page_npartners;
+	uint16	   *page_npartners;
 	AftpInvertedIndex *index;
 
 	(void) top_affinity;		/* unused in this implementation */
@@ -2064,7 +1769,7 @@ AftpBuildInvertedIndex(AftpAffinityMatrix *A, int *P, int n_tuples,
 	}
 
 	/* Step 1: Count partners per page */
-	counts = palloc0((Size) n_pages * sizeof(uint32));
+	counts = palloc0(n_pages * sizeof(uint16));
 	for (uint32 t = 0; t < (uint32) n_tuples; t++)
 	{
 		AftpAffinityRow *row = &A->rows[t];
@@ -2080,15 +1785,13 @@ AftpBuildInvertedIndex(AftpAffinityMatrix *A, int *P, int n_tuples,
 			if (pp < 0 || pp >= n_pages)
 				continue;
 
-			if (counts[pp] == PG_UINT32_MAX)
-				elog(ERROR, "AFTP Phase 4: inverted index is too large");
 			counts[pp]++;
 		}
 	}
 
 	/* Step 2: Allocate per-page arrays */
 	page_partners = palloc(n_pages * sizeof(uint32 *));
-	page_npartners = palloc((Size) n_pages * sizeof(uint32));
+	page_npartners = palloc(n_pages * sizeof(uint16));
 
 	for (int p = 0; p < n_pages; p++)
 	{
@@ -2131,8 +1834,6 @@ AftpBuildInvertedIndex(AftpAffinityMatrix *A, int *P, int n_tuples,
 
 		pfree(seen_gen);
 	}
-	for (int p = 0; p < n_pages; p++)
-		page_npartners[p] = counts[p];
 
 	pfree(counts);
 
@@ -2187,15 +1888,14 @@ AftpFreeInvertedIndex(AftpInvertedIndex *index)
  * ---------------------------------------------------------------- */
 void
 AftpIterativeRefinement(AftpAffinityMatrix *A, int *P, AftpPage **pages,
-						int n_pages, int n_tuples, int max_iterations,
-						Size *tuple_sizes)
+						int n_pages, int n_tuples, int max_iterations, int K)
 {
 	if (n_tuples <= 0 || n_pages <= 0 || max_iterations <= 0)
 		return;
 
 	elog(INFO, "AFTP Phase 4: starting iterative refinement "
-		 "(max_iter=%d, n_tuples=%d, n_pages=%d, byte_capacity=%zu)",
-		 max_iterations, n_tuples, n_pages, pages[0]->capacity_bytes);
+		 "(max_iter=%d, n_tuples=%d, n_pages=%d, K=%d)",
+		 max_iterations, n_tuples, n_pages, K);
 
 	for (int iter = 0; iter < max_iterations; iter++)
 	{
@@ -2253,7 +1953,7 @@ AftpIterativeRefinement(AftpAffinityMatrix *A, int *P, AftpPage **pages,
 				uint32		u = cur_page->tuple_ids[m];
 
 				if (u != t)
-					current_score += LookupPairAffinity(A, t, u);
+					current_score += LookupAffinity(A, t, u);
 			}
 
 			best_page = current_page;
@@ -2274,8 +1974,8 @@ AftpIterativeRefinement(AftpAffinityMatrix *A, int *P, AftpPage **pages,
 					continue;
 				page_seen_gen[pp] = gen;
 
-				/* Respect exact byte capacity for mixed tuple types. */
-				if (!AftpPageCanFit(pages[pp], tuple_sizes[t]))
+				/* Skip full pages */
+				if (pages[pp]->n_tuples >= K)
 					continue;
 
 				/* Compute new score */
@@ -2285,7 +1985,7 @@ AftpIterativeRefinement(AftpAffinityMatrix *A, int *P, AftpPage **pages,
 					AftpPage   *cand_page = pages[pp];
 
 					for (int m = 0; m < cand_page->n_tuples; m++)
-						new_score += LookupPairAffinity(A, t,
+						new_score += LookupAffinity(A, t,
 													cand_page->tuple_ids[m]);
 
 					gain = new_score - current_score;
@@ -2303,8 +2003,8 @@ AftpIterativeRefinement(AftpAffinityMatrix *A, int *P, AftpPage **pages,
 			/* Move if beneficial */
 			if (best_page != current_page)
 			{
-				AftpPageRemoveTuple(pages[current_page], t, tuple_sizes[t]);
-				AftpPageAddTuple(pages[best_page], t, tuple_sizes[t]);
+				page_remove_tuple(pages[current_page], t);
+				page_add_tuple(pages[best_page], t);
 				P[t] = best_page;
 				n_moves++;
 			}
@@ -2346,95 +2046,54 @@ AftpPopulateConfig(AftpConfig *cfg)
 	cfg->max_memory_mb = aftp_max_memory;
 }
 
-/*
- * Remove empty pages and coalesce whole adjacent affinity groups whenever
- * their combined byte size fits.  Merging complete groups cannot reduce LS,
- * avoids splitting a planned group during physical write, and prevents sparse
- * layouts when a page stopped growing because no positive candidate existed.
- */
-static void
-AftpCompactPages(AftpPage **pages, int *n_pages, int *P, Size *tuple_sizes)
-{
-	int			write_page = 0;
-
-	for (int read_page = 0; read_page < *n_pages; read_page++)
-	{
-		AftpPage   *page = pages[read_page];
-
-		if (page->n_tuples == 0)
-			continue;
-		pages[write_page] = page;
-		page->page_id = write_page;
-		for (int i = 0; i < page->n_tuples; i++)
-			P[page->tuple_ids[i]] = write_page;
-		write_page++;
-	}
-
-	if (write_page > 1)
-	{
-		int			coalesced = 1;
-		AftpPage   *target = pages[0];
-
-		for (int source_index = 1; source_index < write_page; source_index++)
-		{
-			AftpPage   *source = pages[source_index];
-
-			if (source->used_bytes <=
-				target->capacity_bytes - target->used_bytes)
-			{
-				for (int i = 0; i < source->n_tuples; i++)
-				{
-					uint32		tuple_id = source->tuple_ids[i];
-
-					AftpPageAddTuple(target, tuple_id, tuple_sizes[tuple_id]);
-					P[tuple_id] = target->page_id;
-				}
-			}
-			else
-			{
-				pages[coalesced] = source;
-				source->page_id = coalesced;
-				for (int i = 0; i < source->n_tuples; i++)
-					P[source->tuple_ids[i]] = coalesced;
-				target = source;
-				coalesced++;
-			}
-		}
-		write_page = coalesced;
-	}
-	*n_pages = write_page;
-}
-
 /* ==================================================================
  * AFTP_Main Pipeline
  *
- * Affinity is computed between ElementTuples only; NeighborTuple trace
- * entries act as position markers.  Packing groups whole elements, and
- * every group is written as one physical page holding each element's
- * ElementTuple next to its NeighborTuple, sized as the byte sum of both
- * tuples plus two line pointers.
+ * Orchestrates all four phases of the AFTP algorithm:
+ *   Phase 1: Trace collection
+ *   Phase 2: Affinity matrix construction (ElementTuple + NeighborTuple)
+ *   Phase 3: Greedy seed-and-grow packing
+ *   Phase 4: Iterative BNF-style refinement (optional)
+ *
+ * Stores results in buildstate:
+ *   aftp_etuple_page  -- P_E[t] = page_id for each ElementTuple
+ *   aftp_ntuple_page  -- P_N[t] = page_id for each NeighborTuple
+ *   aftp_etuple_order -- ElementTuple write order (page-major)
+ *   aftp_ntuple_order -- NeighborTuple write order (page-major)
+ *   aftp_n_epages     -- Total ElementTuple page count
+ *   aftp_n_npages     -- Total NeighborTuple page count
+ *
+ * Free policy:
+ *   - Trace state and affinity matrices are freed inside this function.
+ *   - Packing results (pages_E, pages_N, P_E, P_N, write orders)
+ *     are kept for CreateGraphPagesPacked.
  * ================================================================== */
-bool
+void
 AftpMain(HnswBuildState *buildstate, AftpConfig *config)
 {
 	AftpTraceState *traces;
-	AftpAffinityMatrix *A;
-	Size	   *tuple_sizes;
-	Size		page_capacity;
-	int			nominal_tuples_per_page;
-	int		   *P;
-	AftpPage  **pages;
-	int			n_pages;
-	int			n_tuples;
-	float		LS;
-	float		phase3_LS;
+	AftpAffinityMatrix *A_E;
+	AftpAffinityMatrix *A_N;
+	int			K_E;
+	int			K_N;
+	int		   *P_E;
+	int		   *P_N;
+	AftpPage  **pages_E;
+	AftpPage  **pages_N;
+	int			n_epages;
+	int			n_npages;
+	float		LS_E;
+	float		LS_N;
 	instr_time	pipeline_start;
 	instr_time	phase_start;
 	double		phase1_ms;
-	double		phase2_ms;
+	double		phase2_element_ms;
+	double		phase2_neighbor_ms;
 	double		phase3_capacity_ms;
-	double		phase3_ms;
-	double		phase4_ms = 0.0;
+	double		phase3_element_ms;
+	double		phase3_neighbor_ms;
+	double		phase4_element_ms = 0.0;
+	double		phase4_neighbor_ms = 0.0;
 
 	elog(INFO, "AFTP: starting AFTP_Main pipeline");
 	INSTR_TIME_SET_CURRENT(pipeline_start);
@@ -2452,126 +2111,162 @@ AftpMain(HnswBuildState *buildstate, AftpConfig *config)
 		elog(WARNING, "AFTP: trace collection produced no traces, aborting");
 		elog(INFO, "AFTP timing: pipeline aborted after %.3f ms",
 			 AftpElapsedMilliseconds(pipeline_start));
-		return false;
+		return;
 	}
 
-	/* Packing domain is the element ID space [0, n_elements). */
-	n_tuples = traces->n_elements;
-
 	/* --------------------------------------------------------
-	 * Phase 2: affinity matrix over ElementTuple pairs (E<->E)
+	 * Phase 2: Affinity matrices
 	 * -------------------------------------------------------- */
 	INSTR_TIME_SET_CURRENT(phase_start);
-	A = AftpBuildAffinityMatrix(traces, n_tuples, config->top_affinity,
-								config->window, config->decay_lambda);
-	phase2_ms = AftpElapsedMilliseconds(phase_start);
-	elog(INFO, "AFTP timing: Phase 2 element affinity: %.3f ms",
-		 phase2_ms);
-	if (A == NULL)
+	A_E = AftpBuildAffinityMatrix(traces, traces->n_elements,
+								  config->top_affinity, config->window,
+								  config->decay_lambda, AFTP_TUPLE_ELEMENT);
+	phase2_element_ms = AftpElapsedMilliseconds(phase_start);
+	elog(INFO, "AFTP timing: Phase 2 ElementTuple affinity: %.3f ms",
+		 phase2_element_ms);
+	if (A_E == NULL)
 	{
-		elog(WARNING, "AFTP: failed to build element affinity matrix");
+		elog(WARNING, "AFTP: failed to build ElementTuple affinity matrix");
 		AftpFreeTraceState(traces);
 		elog(INFO, "AFTP timing: pipeline aborted after %.3f ms",
 			 AftpElapsedMilliseconds(pipeline_start));
-		return false;
+		return;
+	}
+
+	INSTR_TIME_SET_CURRENT(phase_start);
+	A_N = AftpBuildAffinityMatrix(traces, traces->n_neighbors,
+								  config->top_affinity, config->window,
+								  config->decay_lambda, AFTP_TUPLE_NEIGHBOR);
+	phase2_neighbor_ms = AftpElapsedMilliseconds(phase_start);
+	elog(INFO, "AFTP timing: Phase 2 NeighborTuple affinity: %.3f ms "
+		 "(total Phase 2: %.3f ms)",
+		 phase2_neighbor_ms, phase2_element_ms + phase2_neighbor_ms);
+	if (A_N == NULL)
+	{
+		elog(WARNING, "AFTP: failed to build NeighborTuple affinity matrix");
+		AftpFreeAffinityMatrix(A_E);
+		AftpFreeTraceState(traces);
+		elog(INFO, "AFTP timing: pipeline aborted after %.3f ms",
+			 AftpElapsedMilliseconds(pipeline_start));
+		return;
 	}
 
 	/* --------------------------------------------------------
-	 * Phase 3: exact per-element byte costs (E+N pair) and page capacity
+	 * Phase 3: Compute page capacities
 	 * -------------------------------------------------------- */
 	INSTR_TIME_SET_CURRENT(phase_start);
-	tuple_sizes = AftpComputeTupleSizes(buildstate, traces->n_elements,
-										&page_capacity,
-										&nominal_tuples_per_page);
+	K_E = AftpComputePageCapacity(buildstate, true);
+	K_N = AftpComputePageCapacity(buildstate, false);
 	phase3_capacity_ms = AftpElapsedMilliseconds(phase_start);
-	elog(INFO, "AFTP timing: Phase 3 byte capacity calculation: %.3f ms",
+	elog(INFO, "AFTP timing: Phase 3 page capacity estimation: %.3f ms",
 		 phase3_capacity_ms);
-	elog(INFO, "AFTP: element-pair page capacity=%zu bytes, "
-		 "nominal elements/page=%d", page_capacity, nominal_tuples_per_page);
+
+	elog(INFO, "AFTP: page capacities: K_E=%d, K_N=%d", K_E, K_N);
 
 	/* --------------------------------------------------------
-	 * Phase 3: element-group greedy seed-and-grow packing
+	 * Phase 3: Greedy seed-and-grow packing
 	 * -------------------------------------------------------- */
 	INSTR_TIME_SET_CURRENT(phase_start);
-	AftpGreedyPacking(A, tuple_sizes, page_capacity, config->seed_softmax,
-					  &P, &pages, &n_pages);
-	phase3_ms = AftpElapsedMilliseconds(phase_start);
-	elog(INFO, "AFTP timing: Phase 3 element-group packing: %.3f ms "
-		 "(total Phase 3: %.3f ms)", phase3_ms,
-		 phase3_capacity_ms + phase3_ms);
-	elog(INFO, "AFTP Phase 3: element-group pages=%d", n_pages);
-	phase3_LS = AftpComputeLocalityScore(A, P, n_tuples);
+	AftpGreedyPacking(A_E, K_E, config->seed_softmax,
+					  &P_E, &pages_E, &n_epages);
+	phase3_element_ms = AftpElapsedMilliseconds(phase_start);
+	elog(INFO, "AFTP timing: Phase 3 ElementTuple packing: %.3f ms",
+		 phase3_element_ms);
+
+	INSTR_TIME_SET_CURRENT(phase_start);
+	AftpGreedyPacking(A_N, K_N, config->seed_softmax,
+					  &P_N, &pages_N, &n_npages);
+	phase3_neighbor_ms = AftpElapsedMilliseconds(phase_start);
+	elog(INFO, "AFTP timing: Phase 3 NeighborTuple packing: %.3f ms "
+		 "(total Phase 3: %.3f ms)",
+		 phase3_neighbor_ms,
+		 phase3_capacity_ms + phase3_element_ms + phase3_neighbor_ms);
+
+	elog(INFO, "AFTP Phase 3: E-pages=%d, N-pages=%d", n_epages, n_npages);
 
 	/* --------------------------------------------------------
 	 * Phase 4: Iterative refinement (if enabled)
 	 * -------------------------------------------------------- */
 	if (config->refine_iterations > 0)
 	{
-		elog(INFO, "AFTP Phase 4: refining element-group layout "
+		elog(INFO, "AFTP Phase 4: refining ElementTuple layout "
 			 "(%d iterations)", config->refine_iterations);
 		INSTR_TIME_SET_CURRENT(phase_start);
-		AftpIterativeRefinement(A, P, pages, n_pages, n_tuples,
-								config->refine_iterations, tuple_sizes);
-		phase4_ms = AftpElapsedMilliseconds(phase_start);
-		elog(INFO, "AFTP timing: Phase 4 element-group refinement: %.3f ms",
-			 phase4_ms);
+		AftpIterativeRefinement(A_E, P_E, pages_E, n_epages,
+								traces->n_elements,
+								config->refine_iterations, K_E);
+		phase4_element_ms = AftpElapsedMilliseconds(phase_start);
+		elog(INFO, "AFTP timing: Phase 4 ElementTuple refinement: %.3f ms",
+			 phase4_element_ms);
+
+		elog(INFO, "AFTP Phase 4: refining NeighborTuple layout "
+			 "(%d iterations)", config->refine_iterations);
+		INSTR_TIME_SET_CURRENT(phase_start);
+		AftpIterativeRefinement(A_N, P_N, pages_N, n_npages,
+								traces->n_neighbors,
+								config->refine_iterations, K_N);
+		phase4_neighbor_ms = AftpElapsedMilliseconds(phase_start);
+		elog(INFO, "AFTP timing: Phase 4 NeighborTuple refinement: %.3f ms "
+			 "(total Phase 4: %.3f ms)",
+			 phase4_neighbor_ms, phase4_element_ms + phase4_neighbor_ms);
 	}
 	else
 		elog(INFO, "AFTP timing: Phase 4 refinement skipped");
-	AftpCompactPages(pages, &n_pages, P, tuple_sizes);
 
 	/* --------------------------------------------------------
 	 * Compute locality scores and log
 	 * -------------------------------------------------------- */
-	LS = AftpComputeLocalityScore(A, P, n_tuples);
-	if (LS + 0.001f < phase3_LS)
-		elog(ERROR, "AFTP Phase 4 reduced locality score from %.3f to %.3f",
-			 (double) phase3_LS, (double) LS);
-	elog(INFO, "AFTP: element-group LS=%.2f (Phase 3 LS=%.2f), pages=%d",
-		 (double) LS, (double) phase3_LS, n_pages);
+	LS_E = AftpComputeLocalityScore(A_E, P_E, traces->n_elements);
+	LS_N = AftpComputeLocalityScore(A_N, P_N, traces->n_neighbors);
+
+	elog(INFO, "AFTP: ElementTuple LS=%.2f, NeighborTuple LS=%.2f, "
+		 "E-pages=%d, N-pages=%d", (double) LS_E, (double) LS_N,
+		 n_epages, n_npages);
 
 	/* --------------------------------------------------------
-	 * Store results in buildstate.  Every packed element expands to
-	 * its ElementTuple followed by its NeighborTuple, so a physical
-	 * page receives both tuples of every element in its group.
+	 * Store results in buildstate
 	 * -------------------------------------------------------- */
-	buildstate->aftp_n_tuples = 2 * n_tuples;
-	buildstate->aftp_n_pages = n_pages;
-	buildstate->aftp_tuple_order = palloc((Size) 2 * n_tuples * sizeof(int));
-	buildstate->aftp_page_starts = palloc((Size) (n_pages + 1) * sizeof(int));
+	buildstate->aftp_etuple_page = P_E;
+	buildstate->aftp_ntuple_page = P_N;
+	buildstate->aftp_n_epages = n_epages;
+	buildstate->aftp_n_npages = n_npages;
+
+	/* --------------------------------------------------------
+	 * Generate write orders (page-major: page_id then tuple_id)
+	 * -------------------------------------------------------- */
+	buildstate->aftp_etuple_order = palloc(traces->n_elements * sizeof(int));
+	buildstate->aftp_ntuple_order = palloc(traces->n_neighbors * sizeof(int));
+
 	{
 		int			idx = 0;
 
-		for (int p = 0; p < n_pages; p++)
-		{
-			buildstate->aftp_page_starts[p] = idx;
-			for (int t = 0; t < pages[p]->n_tuples; t++)
-			{
-				uint32		element_id = pages[p]->tuple_ids[t];
+		for (int p = 0; p < n_epages; p++)
+			for (int t = 0; t < pages_E[p]->n_tuples; t++)
+				buildstate->aftp_etuple_order[idx++] = pages_E[p]->tuple_ids[t];
+	}
 
-				buildstate->aftp_tuple_order[idx++] = (int) element_id;
-				buildstate->aftp_tuple_order[idx++] =
-					(int) element_id + n_tuples;
-			}
-		}
-		buildstate->aftp_page_starts[n_pages] = idx;
-		if (idx != 2 * n_tuples)
-			elog(ERROR, "AFTP packing omitted tuples (%d of %d)", idx,
-				 2 * n_tuples);
+	{
+		int			idx = 0;
+
+		for (int p = 0; p < n_npages; p++)
+			for (int t = 0; t < pages_N[p]->n_tuples; t++)
+				buildstate->aftp_ntuple_order[idx++] = pages_N[p]->tuple_ids[t];
 	}
 
 	/* --------------------------------------------------------
 	 * Free trace data and affinity matrices (keep packing results
 	 * for CreateGraphPagesPacked)
 	 * -------------------------------------------------------- */
-	AftpFreeAffinityMatrix(A);
+	AftpFreeAffinityMatrix(A_E);
+	AftpFreeAffinityMatrix(A_N);
 	AftpFreeTraceState(traces);
-	pfree(tuple_sizes);
 
 	elog(INFO, "AFTP timing summary: Phase 1=%.3f ms, Phase 2=%.3f ms, "
 		 "Phase 3=%.3f ms, Phase 4=%.3f ms, pipeline total=%.3f ms",
-		 phase1_ms, phase2_ms, phase3_capacity_ms + phase3_ms, phase4_ms,
+		 phase1_ms,
+		 phase2_element_ms + phase2_neighbor_ms,
+		 phase3_capacity_ms + phase3_element_ms + phase3_neighbor_ms,
+		 phase4_element_ms + phase4_neighbor_ms,
 		 AftpElapsedMilliseconds(pipeline_start));
 	elog(INFO, "AFTP: AFTP_Main pipeline completed successfully");
-	return true;
 }

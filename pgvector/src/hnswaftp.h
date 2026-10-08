@@ -11,12 +11,6 @@
  * Build-time optimization that reorders tuple placement within
  * pages to improve buffer hit rate during HNSW search.
  *
- * Affinity is computed between ElementTuples only; NeighborTuple
- * trace entries are position markers.  Packing groups whole
- * elements, and each element's ElementTuple and NeighborTuple are
- * always written to the same page, sized together (both tuples
- * plus two line pointers).
- *
  * Four-phase algorithm:
  *   Phase 1 — Trace Collection
  *   Phase 2 — Affinity Matrix
@@ -93,24 +87,21 @@ typedef struct AftpAffinityMatrix
  * 3. Packing Structures (§3.4, §3.5)
  * ============================ */
 
-/* One packed group — written as one physical PostgreSQL page holding each
- * element's ElementTuple and NeighborTuple */
+/* A logical page in the AFTP layout (not a physical PostgreSQL page) */
 typedef struct AftpPage
 {
 	int			page_id;		/* Logical page ID */
-	int			n_tuples;		/* Current number of elements in this page */
-	int			tuple_capacity;	/* Allocated entries in tuple_ids */
-	Size		used_bytes;		/* Bytes of both tuples plus line pointers */
-	Size		capacity_bytes;	/* Exact usable bytes in a PostgreSQL page */
-	uint32	   *tuple_ids;		/* Array of element IDs in this page */
+	int			n_tuples;		/* Current number of tuples in this page */
+	int			capacity;		/* Max tuples (K — page capacity) */
+	uint32	   *tuple_ids;		/* Array of tuple IDs in this page */
 }			AftpPage;
 
-/* Page→element inverted index for Phase 4 fast candidate filtering (§3.5) */
+/* Page→Tuple inverted index for Phase 4 fast candidate filtering (§3.5) */
 typedef struct AftpInvertedIndex
 {
-	uint32	  **page_partners;	/* page_partners[p] = sorted array of external element IDs
+	uint32	  **page_partners;	/* page_partners[p] = sorted array of external tuple IDs
 								 * that have non-zero affinity with page p */
-	uint32	   *page_npartners; /* Number of partners per page */
+	uint16	   *page_npartners; /* Number of partners per page */
 	int			n_pages;		/* Total page count */
 }			AftpInvertedIndex;
 
@@ -177,30 +168,31 @@ extern int		aftp_max_memory;
  * ================================= */
 
 /* Main AFTP entry point */
-extern bool AftpMain(HnswBuildState *buildstate, AftpConfig *config);
+extern void AftpMain(HnswBuildState *buildstate, AftpConfig *config);
 
 /* Phase 1: Trace collection */
 extern AftpTraceState *AftpCollectTraces(HnswBuildState *buildstate, AftpConfig *config);
 
-/* Phase 2: Affinity matrix construction (ElementTuple pairs only; n_tuples
- * is the element count and IDs are element IDs) */
+/* Phase 2: Affinity matrix construction */
 extern AftpAffinityMatrix *AftpBuildAffinityMatrix(AftpTraceState *traces,
-	int n_tuples, int top_affinity, int window, double decay_lambda);
+	int n_tuples, int top_affinity, int window, double decay_lambda, uint8 target_type);
 
 /* Phase 3: Greedy seed-and-grow packing */
-extern void AftpGreedyPacking(AftpAffinityMatrix *A, Size *tuple_sizes,
-	Size page_capacity, int seed_softmax,
+extern void AftpGreedyPacking(AftpAffinityMatrix *A, int K, int seed_softmax,
 	int **out_page_assignment, AftpPage ***out_pages, int *out_n_pages);
 
 /* Phase 4: Iterative BNF-style refinement */
 extern void AftpIterativeRefinement(AftpAffinityMatrix *A, int *P, AftpPage **pages,
-	int n_pages, int n_tuples, int max_iterations, Size *tuple_sizes);
+	int n_pages, int n_tuples, int max_iterations, int K);
 
 /* Utility: populate AftpConfig from GUC variables */
 extern void AftpPopulateConfig(AftpConfig *cfg);
 
 /* Utility: assign sequential IDs to all tuples */
 extern void AftpAssignTupleIds(HnswBuildState *buildstate, int *n_elements, int *n_neighbors);
+
+/* Utility: compute page capacity for a given tuple type */
+extern int	AftpComputePageCapacity(HnswBuildState *buildstate, bool is_element_tuple);
 
 /* Utility: compute locality score LS(P) */
 extern float AftpComputeLocalityScore(AftpAffinityMatrix *A, int *P, int n_tuples);
@@ -212,5 +204,8 @@ extern bool AftpCheckTraceConvergence(AftpQueryTrace *traces, int n_queries,
 /* Utility: free resources */
 extern void AftpFreeTraceState(AftpTraceState *state);
 extern void AftpFreeAffinityMatrix(AftpAffinityMatrix *A);
+
+/* GUC check hook */
+extern bool	aftp_check_hook(int *newval, void **extra, GucSource source);
 
 #endif							/* HNSWAFTP_H */

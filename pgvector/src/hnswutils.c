@@ -296,7 +296,13 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	Page		page;
 	HnswMetaPage metap;
 
+	int64		io_before = 0;
+
+	if (hnsw_io_track)
+		HnswIOCountLayerReadBegin(&io_before);
 	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+	if (hnsw_io_track)
+		HnswIOCountLayerReadEnd(io_before, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	metap = HnswPageGetMeta(page);
@@ -304,51 +310,18 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
 		elog(ERROR, "hnsw index is not valid");
 
+	/* Centralized NeighborTuple storage format requires version >= 2 */
 	if (unlikely(metap->version != HNSW_VERSION))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("hnsw index storage version mismatch"),
-				 errdetail("Index \"%s\" uses storage version %u, but this server expects version %u.",
-						   RelationGetRelationName(index), metap->version,
-						   HNSW_VERSION),
-				 errhint("REINDEX the index with the current vector extension.")));
-
-	/*
-	 * Old native v0.8.0 metapages end at insertPage.  Only inspect the
-	 * appended AFTP marker when pd_lower proves those bytes are part of the
-	 * metapage, so old native indexes cannot be mistaken for packed indexes.
-	 */
-	if (((PageHeader) page)->pd_lower >=
-		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page)
-	{
-		if (metap->aftpMagicNumber == HNSW_AFTP_MAGIC_NUMBER)
-		{
-			if (unlikely(metap->aftpStorageVersion != HNSW_AFTP_STORAGE_VERSION))
-				ereport(ERROR,
-						(errcode(ERRCODE_INDEX_CORRUPTED),
-						 errmsg("unsupported AFTP storage version %u",
-								metap->aftpStorageVersion),
-						 errhint("REINDEX the index with the current vector extension.")));
-			if (unlikely(metap->aftpBuildStatus != AFTP_BUILD_COMPLETED))
-				ereport(ERROR,
-						(errcode(ERRCODE_INDEX_CORRUPTED),
-						 errmsg("AFTP index build is incomplete"),
-						 errdetail("Index \"%s\" has AFTP build status %u.",
-								   RelationGetRelationName(index),
-								   metap->aftpBuildStatus),
-						 errhint("REINDEX the index.")));
-		}
-		else if (unlikely(metap->aftpMagicNumber != 0 ||
-						   metap->aftpStorageVersion != 0 ||
-						   metap->aftpBuildStatus != AFTP_BUILD_NOT_STARTED ||
-						   metap->aftpElementPages != 0 ||
-						   metap->aftpNeighborPages != 0))
-			ereport(ERROR,
-					(errcode(ERRCODE_INDEX_CORRUPTED),
-					 errmsg("invalid AFTP marker in hnsw index \"%s\"",
-							RelationGetRelationName(index)),
-					 errhint("REINDEX the index.")));
-	}
+				 errdetail("Index \"%s\" uses storage version %u, "
+						   "but this server expects version %u.",
+						   RelationGetRelationName(index),
+						   metap->version, HNSW_VERSION),
+				 errhint("REINDEX INDEX %s to upgrade the index to the new format. "
+						 "This is required because the NeighborTuple storage layout has changed.",
+						 RelationGetRelationName(index))));
 
 	if (m != NULL)
 		*m = metap->m;
@@ -384,7 +357,7 @@ HnswGetEntryPoint(Relation index)
  * Update the metapage info
  */
 static void
-HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, BlockNumber insertPage)
+HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, BlockNumber neighborInsertPage)
 {
 	HnswMetaPage metap = HnswPageGetMeta(page);
 
@@ -406,19 +379,28 @@ HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, Block
 
 	if (BlockNumberIsValid(insertPage))
 		metap->insertPage = insertPage;
+
+	if (BlockNumberIsValid(neighborInsertPage))
+		metap->neighborInsertPage = neighborInsertPage;
 }
 
 /*
  * Update the metapage
  */
 void
-HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building)
+HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, BlockNumber neighborInsertPage, ForkNumber forkNum, bool building, HnswWriteReason reason)
 {
 	Buffer		buf;
 	Page		page;
 	GenericXLogState *state;
 
+	int64		io_before = 0;
+
+	if (hnsw_io_track)
+		HnswIOCountLayerReadBegin(&io_before);
 	buf = ReadBufferExtended(index, forkNum, HNSW_METAPAGE_BLKNO, RBM_NORMAL, NULL);
+	if (hnsw_io_track)
+		HnswIOCountLayerReadEnd(io_before, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	if (building)
 	{
@@ -431,12 +413,36 @@ HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, Bloc
 		page = GenericXLogRegisterBuffer(state, buf, 0);
 	}
 
-	HnswUpdateMetaPageInfo(page, updateEntry, entryPoint, insertPage);
+	HnswUpdateMetaPageInfo(page, updateEntry, entryPoint, insertPage, neighborInsertPage);
 
 	if (building)
+	{
 		MarkBufferDirty(buf);
+		if (hnsw_io_track)
+		{
+			hnsw_io_write_pages++;
+			if (HnswIOMarkPageUpdated(BufferGetBlockNumber(buf)))
+			{
+				hnsw_io_write_reason_counts[reason]++;
+				hnsw_io_updated_pages++;
+			}
+			hnsw_io_total_ios++;
+		}
+	}
 	else
+	{
 		GenericXLogFinish(state);
+		if (hnsw_io_track)
+		{
+			hnsw_io_write_pages++;
+			if (HnswIOMarkPageUpdated(BufferGetBlockNumber(buf)))
+			{
+				hnsw_io_write_reason_counts[reason]++;
+				hnsw_io_updated_pages++;
+			}
+			hnsw_io_total_ios++;
+		}
+	}
 	UnlockReleaseBuffer(buf);
 }
 
@@ -577,8 +583,14 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	Page		page;
 	HnswElementTuple etup;
 
-	/* Read vector */
+	int64		io_before = 0;
+
+	/* Read vector — per-layer + seq/rand IO tracking */
+	if (hnsw_io_track)
+		HnswIOCountLayerReadBegin(&io_before);
 	buf = ReadBuffer(index, blkno);
+	if (hnsw_io_track)
+		HnswIOCountLayerReadEnd(io_before, blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
@@ -801,7 +813,14 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 	HnswNeighborTuple ntup;
 	int			start;
 
+	int64		io_before = 0;
+
+	/* Per-layer + seq/rand IO tracking */
+	if (hnsw_io_track)
+		HnswIOCountLayerReadBegin(&io_before);
 	buf = ReadBuffer(index, element->neighborPage);
+	if (hnsw_io_track)
+		HnswIOCountLayerReadEnd(io_before, element->neighborPage);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
@@ -1324,6 +1343,9 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	HnswElement skipElement = existing ? element : NULL;
 	bool		inMemory = index == NULL;
 
+	/* Defensive reset: clean up any stale layer state from prior ERROR */
+	hnsw_io_current_layer = -1;
+
 	q.value = HnswGetValue(base, element);
 
 	/* Precompute hash */
@@ -1332,15 +1354,20 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 
 	/* No neighbors if no entry point */
 	if (entryPoint == NULL)
+	{
+		hnsw_io_current_layer = -1;
 		return;
+	}
 
 	/* Get entry point and level */
-	ep = list_make1(HnswEntryCandidate(base, entryPoint, &q, index, support, true));
 	entryLevel = entryPoint->level;
+	hnsw_io_current_layer = entryLevel;
+	ep = list_make1(HnswEntryCandidate(base, entryPoint, &q, index, support, true));
 
 	/* 1st phase: greedy search to insert level */
 	for (int lc = entryLevel; lc >= level + 1; lc--)
 	{
+		hnsw_io_current_layer = lc;
 		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
 		ep = w;
 	}
@@ -1360,6 +1387,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		List	   *lw = NIL;
 		ListCell   *lc2;
 
+		hnsw_io_current_layer = lc;
 		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
 
 		/* Convert search candidates to candidates */
@@ -1390,6 +1418,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 
 		ep = w;
 	}
+
+	hnsw_io_current_layer = -1;
 }
 
 PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);

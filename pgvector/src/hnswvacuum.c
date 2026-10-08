@@ -51,7 +51,13 @@ RemoveHeapTids(HnswVacuumState * vacuumstate)
 
 		vacuum_delay_point();
 
+		int64		io_before = 0;
+
+		if (hnsw_io_track)
+			HnswIOCountLayerReadBegin(&io_before);
 		buf = ReadBufferExtended(index, MAIN_FORKNUM, blkno, RBM_NORMAL, bas);
+		if (hnsw_io_track)
+			HnswIOCountLayerReadEnd(io_before, blkno);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		state = GenericXLogStart(index);
 		page = GenericXLogRegisterBuffer(state, buf, 0);
@@ -144,7 +150,13 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
 	HnswNeighborTuple ntup;
 	bool		needsUpdated = false;
 
+	int64		io_before = 0;
+
+	if (hnsw_io_track)
+		HnswIOCountLayerReadBegin(&io_before);
 	buf = ReadBufferExtended(index, MAIN_FORKNUM, element->neighborPage, RBM_NORMAL, bas);
+	if (hnsw_io_track)
+		HnswIOCountLayerReadEnd(io_before, element->neighborPage);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, element->neighborOffno));
@@ -214,7 +226,13 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
 	HnswSetNeighborTuple(base, ntup, element, m);
 
 	/* Get neighbor page */
+	int64		io_before = 0;
+
+	if (hnsw_io_track)
+		HnswIOCountLayerReadBegin(&io_before);
 	buf = ReadBufferExtended(index, MAIN_FORKNUM, element->neighborPage, RBM_NORMAL, bas);
+	if (hnsw_io_track)
+		HnswIOCountLayerReadEnd(io_before, element->neighborPage);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	state = GenericXLogStart(index);
 	page = GenericXLogRegisterBuffer(state, buf, 0);
@@ -285,7 +303,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
 			 * point is outdated and empty, the entry point will be empty
 			 * until an element is repaired.
 			 */
-			HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, highestPoint, InvalidBlockNumber, MAIN_FORKNUM, false);
+			HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, highestPoint, InvalidBlockNumber, InvalidBlockNumber, MAIN_FORKNUM, false, HNSW_WRITE_UPDATE_META_ENTRY_POINT);
 		}
 		else
 		{
@@ -349,7 +367,13 @@ RepairGraph(HnswVacuumState * vacuumstate)
 
 		oldCtx = MemoryContextSwitchTo(vacuumstate->tmpCtx);
 
+		int64		io_before = 0;
+
+		if (hnsw_io_track)
+			HnswIOCountLayerReadBegin(&io_before);
 		buf = ReadBufferExtended(index, MAIN_FORKNUM, blkno, RBM_NORMAL, bas);
+		if (hnsw_io_track)
+			HnswIOCountLayerReadEnd(io_before, blkno);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		maxoffno = PageGetMaxOffsetNumber(page);
@@ -418,7 +442,7 @@ RepairGraph(HnswVacuumState * vacuumstate)
 			 * was replaced and highest point was outdated.
 			 */
 			if (entryPoint == NULL || element->level > entryPoint->level)
-				HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM, false);
+				HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, InvalidBlockNumber, MAIN_FORKNUM, false, HNSW_WRITE_UPDATE_META_ENTRY_POINT);
 
 			/* Release lock */
 			UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
@@ -459,7 +483,13 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 
 		vacuum_delay_point();
 
+		int64		io_before = 0;
+
+		if (hnsw_io_track)
+			HnswIOCountLayerReadBegin(&io_before);
 		buf = ReadBufferExtended(index, MAIN_FORKNUM, blkno, RBM_NORMAL, bas);
+		if (hnsw_io_track)
+			HnswIOCountLayerReadEnd(io_before, blkno);
 
 		/*
 		 * ambulkdelete cannot delete entries from pages that are pinned by
@@ -505,17 +535,18 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 			neighborPage = ItemPointerGetBlockNumber(&etup->neighbortid);
 			neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
 
-			if (neighborPage == blkno)
-			{
-				nbuf = buf;
-				npage = page;
-			}
-			else
-			{
-				nbuf = ReadBufferExtended(index, MAIN_FORKNUM, neighborPage, RBM_NORMAL, bas);
-				LockBuffer(nbuf, BUFFER_LOCK_EXCLUSIVE);
-				npage = GenericXLogRegisterBuffer(state, nbuf, 0);
-			}
+			/* NeighborTuple is always on an independent centralized page */
+			Assert(neighborPage != blkno);
+
+			int64		io_before = 0;
+
+			if (hnsw_io_track)
+				HnswIOCountLayerReadBegin(&io_before);
+			nbuf = ReadBufferExtended(index, MAIN_FORKNUM, neighborPage, RBM_NORMAL, bas);
+			if (hnsw_io_track)
+				HnswIOCountLayerReadEnd(io_before, neighborPage);
+			LockBuffer(nbuf, BUFFER_LOCK_EXCLUSIVE);
+			npage = GenericXLogRegisterBuffer(state, nbuf, 0);
 
 			ntup = (HnswNeighborTuple) PageGetItem(npage, PageGetItemId(npage, neighborOffno));
 
@@ -561,7 +592,7 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 	}
 
 	/* Update insert page last, after everything has been marked as deleted */
-	HnswUpdateMetaPage(index, 0, NULL, insertPage, MAIN_FORKNUM, false);
+	HnswUpdateMetaPage(index, 0, NULL, insertPage, InvalidBlockNumber, MAIN_FORKNUM, false, HNSW_WRITE_UPDATE_META_INSERT_PAGE);
 }
 
 /*

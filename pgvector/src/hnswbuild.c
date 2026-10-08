@@ -66,6 +66,7 @@
 #include "utils/wait_event.h"
 #endif
 
+/* Return elapsed wall-clock time since start in milliseconds. */
 static double
 AftpBuildElapsedMilliseconds(instr_time start)
 {
@@ -73,6 +74,7 @@ AftpBuildElapsedMilliseconds(instr_time start)
 
 	INSTR_TIME_SET_CURRENT(end);
 	INSTR_TIME_SUBTRACT(end, start);
+
 	return INSTR_TIME_GET_MILLISEC(end);
 }
 
@@ -107,26 +109,12 @@ CreateMetaPage(HnswBuildState * buildstate)
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
 	metap->insertPage = InvalidBlockNumber;
-	metap->aftpMagicNumber = 0;
-	metap->aftpStorageVersion = 0;
-	metap->aftpBuildStatus = AFTP_BUILD_NOT_STARTED;
-	metap->aftpReserved = 0;
-	metap->aftpElementPages = 0;
-	metap->aftpNeighborPages = 0;
-
-	if (buildstate->aftp_status != AFTP_BUILD_NOT_STARTED)
-	{
-		metap->aftpMagicNumber = HNSW_AFTP_MAGIC_NUMBER;
-		metap->aftpStorageVersion = HNSW_AFTP_STORAGE_VERSION;
-		metap->aftpBuildStatus = buildstate->aftp_status;
-	}
-	/* Keep AFTP-off metapages byte-layout compatible with native v0.8.0. */
-	if (buildstate->aftp_status == AFTP_BUILD_NOT_STARTED)
-		((PageHeader) page)->pd_lower =
-			((char *) &metap->aftpMagicNumber) - (char *) page;
-	else
-		((PageHeader) page)->pd_lower =
-			((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
+	metap->aftp_build_status = 0;
+	metap->aftp_storage_version = 0;
+	metap->aftp_n_epages = 0;
+	metap->aftp_n_npages = 0;
+	((PageHeader) page)->pd_lower =
+		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
 
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
@@ -161,41 +149,51 @@ HnswBuildAppendPage(Relation index, Buffer *buf, Page *page, ForkNumber forkNum)
 }
 
 /*
- * Create graph pages
+ * Create graph pages — centralized NeighborTuple version
+ *
+ * Maintains two independent page chains:
+ *   1. ElementTuple chain (ebuf/epage) — only ElementTuples
+ *   2. NeighborTuple chain (nbuf/npage) — only NeighborTuples
+ *
+ * ElementTuple.neighbortid → (neighborPage, neighborOffno)
+ * points to the centralized NeighborTuple page chain.
  */
 static void
 CreateGraphPages(HnswBuildState * buildstate)
 {
 	Relation	index = buildstate->index;
 	ForkNumber	forkNum = buildstate->forkNum;
-	Size		maxSize;
 	HnswElementTuple etup;
 	HnswNeighborTuple ntup;
 	BlockNumber insertPage;
+	BlockNumber neighborInsertPage;
 	HnswElement entryPoint;
-	Buffer		buf;
-	Page		page;
+	Buffer		ebuf;		/* ElementTuple page buffer */
+	Page		epage;		/* ElementTuple page */
+	Buffer		nbuf;		/* NeighborTuple page buffer (centralized pool) */
+	Page		npage;		/* NeighborTuple page (centralized pool) */
 	HnswElementPtr iter = buildstate->graph->head;
 	char	   *base = buildstate->hnswarea;
-
-	/* Calculate sizes */
-	maxSize = HNSW_MAX_SIZE;
 
 	/* Allocate once */
 	etup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
 	ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
 
-	/* Prepare first page */
-	buf = HnswNewBuffer(index, forkNum);
-	page = BufferGetPage(buf);
-	HnswInitPage(buf, page);
+	/* Prepare first ElementTuple page */
+	ebuf = HnswNewBuffer(index, forkNum);
+	epage = BufferGetPage(ebuf);
+	HnswInitPage(ebuf, epage);
+
+	/* Prepare first NeighborTuple page (centralized pool) */
+	nbuf = HnswNewBuffer(index, forkNum);
+	npage = BufferGetPage(nbuf);
+	HnswInitPage(nbuf, npage);
 
 	while (!HnswPtrIsNull(base, iter))
 	{
 		HnswElement element = HnswPtrAccess(base, iter);
 		Size		etupSize;
 		Size		ntupSize;
-		Size		combinedSize;
 		Pointer		valuePtr = HnswPtrAccess(base, element->value);
 
 		/* Update iterator */
@@ -207,7 +205,6 @@ CreateGraphPages(HnswBuildState * buildstate)
 		/* Calculate sizes */
 		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
-		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
 		/* Initial size check */
 		if (etupSize > HNSW_TUPLE_ALLOC_SIZE)
@@ -217,333 +214,251 @@ CreateGraphPages(HnswBuildState * buildstate)
 
 		HnswSetElementTuple(base, etup, element);
 
-		/* Keep element and neighbors on the same page if possible */
-		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
-			HnswBuildAppendPage(index, &buf, &page, forkNum);
+		/*
+		 * ElementTuple: write to ElementTuple page chain.
+		 * Append new ElementTuple page when out of space.
+		 */
+		if (PageGetFreeSpace(epage) < etupSize)
+			HnswBuildAppendPage(index, &ebuf, &epage, forkNum);
 
-		/* Calculate offsets */
-		element->blkno = BufferGetBlockNumber(buf);
-		element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
-		if (combinedSize <= maxSize)
-		{
-			element->neighborPage = element->blkno;
-			element->neighborOffno = OffsetNumberNext(element->offno);
-		}
-		else
-		{
-			element->neighborPage = element->blkno + 1;
-			element->neighborOffno = FirstOffsetNumber;
-		}
+		element->blkno = BufferGetBlockNumber(ebuf);
+		element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(epage));
+
+		/*
+		 * NeighborTuple: write to centralized NeighborTuple page chain.
+		 * Append new NeighborTuple page when out of space.
+		 */
+		if (PageGetFreeSpace(npage) < ntupSize)
+			HnswBuildAppendPage(index, &nbuf, &npage, forkNum);
+
+		element->neighborPage = BufferGetBlockNumber(nbuf);
+		element->neighborOffno = OffsetNumberNext(PageGetMaxOffsetNumber(npage));
 
 		ItemPointerSet(&etup->neighbortid, element->neighborPage, element->neighborOffno);
 
-		/* Add element */
-		if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
+		/* Add element to ElementTuple page */
+		if (PageAddItem(epage, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 
-		/* Add new page if needed */
-		if (PageGetFreeSpace(page) < ntupSize)
-			HnswBuildAppendPage(index, &buf, &page, forkNum);
-
-		/* Add placeholder for neighbors */
-		if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
+		/* Add neighbor placeholder to centralized NeighborTuple page */
+		if (PageAddItem(npage, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 	}
 
-	insertPage = BufferGetBlockNumber(buf);
+	insertPage = BufferGetBlockNumber(ebuf);
+	neighborInsertPage = BufferGetBlockNumber(nbuf);
 
-	/* Commit */
-	MarkBufferDirty(buf);
-	UnlockReleaseBuffer(buf);
+	/* Commit ElementTuple page chain */
+	MarkBufferDirty(ebuf);
+	UnlockReleaseBuffer(ebuf);
+
+	/* Commit NeighborTuple page chain */
+	MarkBufferDirty(nbuf);
+	UnlockReleaseBuffer(nbuf);
 
 	entryPoint = HnswPtrAccess(base, buildstate->graph->entryPoint);
-	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint, insertPage, forkNum, true);
+	/* Pass actual neighborInsertPage to metapage */
+	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint,
+	                   insertPage, neighborInsertPage,
+	                   forkNum, true, HNSW_WRITE_UPDATE_META_ENTRY_POINT);
 
 	pfree(etup);
 	pfree(ntup);
 }
 
-typedef struct AftpBackfillSortEntry
+/* ----------------------------------------------------------------
+ * Backfill sort entry for Pass 3 group-by-blkno processing.
+ * ---------------------------------------------------------------- */
+typedef struct
 {
 	BlockNumber blkno;
 	OffsetNumber offno;
 	BlockNumber neighborPage;
 	OffsetNumber neighborOffno;
-}			AftpBackfillSortEntry;
+}			BackfillSortEntry;
 
-typedef struct AftpTupleWriteEntry
-{
-	BlockNumber blkno;
-	OffsetNumber offno;
-	int			elementId;
-}			AftpTupleWriteEntry;
-
+/* Comparison function for sorting BackfillSortEntry by blkno */
 static int
-CompareAftpBackfill(const void *a, const void *b)
+compare_backfill_by_blkno(const void *a, const void *b)
 {
-	const AftpBackfillSortEntry *ea = (const AftpBackfillSortEntry *) a;
-	const AftpBackfillSortEntry *eb = (const AftpBackfillSortEntry *) b;
+	BlockNumber ba = ((const BackfillSortEntry *) a)->blkno;
+	BlockNumber bb = ((const BackfillSortEntry *) b)->blkno;
 
-	if (ea->blkno < eb->blkno)
+	if (ba < bb)
 		return -1;
-	if (ea->blkno > eb->blkno)
-		return 1;
-	if (ea->offno < eb->offno)
-		return -1;
-	if (ea->offno > eb->offno)
+	if (ba > bb)
 		return 1;
 	return 0;
-}
-
-static int
-CompareAftpTupleWrite(const void *a, const void *b)
-{
-	const AftpTupleWriteEntry *ea = (const AftpTupleWriteEntry *) a;
-	const AftpTupleWriteEntry *eb = (const AftpTupleWriteEntry *) b;
-
-	if (ea->blkno < eb->blkno)
-		return -1;
-	if (ea->blkno > eb->blkno)
-		return 1;
-	if (ea->offno < eb->offno)
-		return -1;
-	if (ea->offno > eb->offno)
-		return 1;
-	return 0;
-}
-
-/* Persist AFTP state without changing the native HNSW storage version. */
-static void
-UpdateAftpMetaPage(HnswBuildState *buildstate, AftpBuildStatus status)
-{
-	Buffer		buf;
-	Page		page;
-	HnswMetaPage metap;
-
-	buf = ReadBufferExtended(buildstate->index, buildstate->forkNum,
-							 HNSW_METAPAGE_BLKNO, RBM_NORMAL, NULL);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-	page = BufferGetPage(buf);
-	metap = HnswPageGetMeta(page);
-
-	if (metap->magicNumber != HNSW_MAGIC_NUMBER ||
-		metap->aftpMagicNumber != HNSW_AFTP_MAGIC_NUMBER ||
-		metap->aftpStorageVersion != HNSW_AFTP_STORAGE_VERSION)
-		elog(ERROR, "invalid AFTP metapage while building index \"%s\"",
-			 RelationGetRelationName(buildstate->index));
-
-	metap->aftpBuildStatus = status;
-	metap->aftpElementPages = buildstate->aftp_n_epages;
-	metap->aftpNeighborPages = buildstate->aftp_n_npages;
-	MarkBufferDirty(buf);
-	UnlockReleaseBuffer(buf);
-	buildstate->aftp_status = status;
 }
 
 /*
- * Write the AFTP element-group layout while retaining the native tuple
- * representation and one continuous HNSW page chain.
+ * Create graph pages in AFTP-optimized packed order
  *
- * Phase 3/4 groups elements by affinity; every group occupies one physical
- * page that stores each element's ElementTuple next to its NeighborTuple.
- * Pass 1 writes both tuple types in group order (NeighborTuples as
- * placeholders).  Pass 2 fills the neighbor placeholders after every
- * ElementTuple has its final physical TID.  Pass 3 backfills neighbortid in
- * ElementTuples.  Page boundaries from Phase 3/4 are preserved exactly.
+ * Three passes:
+ *   Pass 1: Write ElementTuples in aftp_etuple_order[]
+ *   Pass 2: Write NeighborTuple placeholders in aftp_ntuple_order[]
+ *   Pass 3: Backfill ElementTuple.neighbortid, grouped by blkno
+ *
+ * Requires that AftpMain() has already populated the aftp_* fields
+ * in buildstate.  After this function, WriteNeighborTuples() fills
+ * the actual neighbor data into the placeholder slots.
  */
 static void
 CreateGraphPagesPacked(HnswBuildState *buildstate)
 {
 	Relation	index = buildstate->index;
 	ForkNumber	forkNum = buildstate->forkNum;
-	char	   *base = buildstate->hnswarea;
-	HnswElementPtr iter;
-	HnswElement *id_to_element;
 	HnswElementTuple etup;
 	HnswNeighborTuple ntup;
-	Buffer		buf;
-	Page		page;
-	int			n_elements = 0;
-	int			n_element_pages = 0;
-	int			n_neighbor_pages = 0;
-	AftpTupleWriteEntry *neighbor_entries;
-	bool	   *seen_tuple;
+	Buffer		ebuf;
+	Page		epage;
+	Buffer		nbuf;
+	Page		npage;
+	HnswElementPtr iter = buildstate->graph->head;
+	char	   *base = buildstate->hnswarea;
+	int			n_elements;
+	int			n_neighbors;
+	HnswElement *id_to_element;
 	BlockNumber insertPage;
+	BlockNumber neighborInsertPage;
 	instr_time	packed_start;
 	instr_time	pass_start;
 	double		pass1_ms;
 	double		pass2_ms;
 	double		pass3_ms;
 
-	iter = buildstate->graph->head;
+	/* ---- Count elements and build id_to_element mapping ---- */
+	n_elements = 0;
 	while (!HnswPtrIsNull(base, iter))
 	{
 		n_elements++;
 		iter = HnswPtrAccess(base, iter)->next;
 	}
-	if (n_elements <= 0)
-		elog(ERROR, "AFTP packed writer requires a non-empty graph");
-	if (buildstate->aftp_tuple_order == NULL ||
-		buildstate->aftp_page_starts == NULL ||
-		buildstate->aftp_n_tuples != n_elements * 2 ||
-		buildstate->aftp_n_pages <= 0 ||
-		buildstate->aftp_page_starts[0] != 0 ||
-		buildstate->aftp_page_starts[buildstate->aftp_n_pages] !=
-			buildstate->aftp_n_tuples)
-		elog(ERROR, "AFTP packing did not produce a complete element-group layout");
+	n_neighbors = n_elements;
+
+	if (n_elements == 0)
+		return;
 
 	INSTR_TIME_SET_CURRENT(packed_start);
-	id_to_element = palloc0((Size) n_elements * sizeof(HnswElement));
+
+	id_to_element = palloc(n_elements * sizeof(HnswElement));
 	iter = buildstate->graph->head;
 	while (!HnswPtrIsNull(base, iter))
 	{
 		HnswElement element = HnswPtrAccess(base, iter);
-
-		if (element->blkno >= (uint32) n_elements ||
-			id_to_element[element->blkno] != NULL)
-			elog(ERROR, "invalid AFTP tuple ID while writing packed pages");
-		id_to_element[element->blkno] = element;
+		id_to_element[element->aftp_tuple_id] = element;
 		iter = element->next;
 	}
 
+	/* Allocate once */
 	etup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
 	ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
-	neighbor_entries = palloc((Size) n_elements * sizeof(AftpTupleWriteEntry));
-	seen_tuple = palloc0((Size) buildstate->aftp_n_tuples * sizeof(bool));
 
-	/* Pass 1: element-group pages, each element's E and N tuples adjacent. */
+	/****************************************************
+	 * Pass 1: Write ElementTuples in packed order
+	 ****************************************************/
 	INSTR_TIME_SET_CURRENT(pass_start);
-	buf = HnswNewBuffer(index, forkNum);
-	page = BufferGetPage(buf);
-	HnswInitPage(buf, page);
-
-	for (int p = 0; p < buildstate->aftp_n_pages; p++)
 	{
-		bool		has_element = false;
-		bool		has_neighbor = false;
-		int			start = buildstate->aftp_page_starts[p];
-		int			end = buildstate->aftp_page_starts[p + 1];
+		BlockNumber *etuple_blkno;
+		OffsetNumber *etuple_offno;
 
-		if (p > 0)
-			HnswBuildAppendPage(index, &buf, &page, forkNum);
-		if (start < 0 || end <= start || end > buildstate->aftp_n_tuples)
-			elog(ERROR, "invalid AFTP logical page boundary %d:[%d,%d)",
-				 p, start, end);
+		ebuf = HnswNewBuffer(index, forkNum);
+		epage = BufferGetPage(ebuf);
+		HnswInitPage(ebuf, epage);
 
-		for (int i = start; i < end; i++)
+		etuple_blkno = palloc0(n_elements * sizeof(BlockNumber));
+		etuple_offno = palloc0(n_elements * sizeof(OffsetNumber));
+
+		for (int i = 0; i < n_elements; i++)
 		{
-			int			tuple_id = buildstate->aftp_tuple_order[i];
-			int			element_id;
-			HnswElement element;
-			Size		tuple_size;
-			OffsetNumber offno;
+			int			tid = buildstate->aftp_etuple_order[i];
+			HnswElement element = id_to_element[tid];
+			Size		etupSize;
+			Pointer		valuePtr = HnswPtrAccess(base, element->value);
 
-			if (tuple_id < 0 || tuple_id >= buildstate->aftp_n_tuples ||
-				seen_tuple[tuple_id])
-				elog(ERROR, "invalid tuple ID %d in AFTP element-group write order",
-					 tuple_id);
-			seen_tuple[tuple_id] = true;
-			element_id = tuple_id < n_elements ? tuple_id : tuple_id - n_elements;
-			element = id_to_element[element_id];
-			if (element == NULL)
-				elog(ERROR, "AFTP tuple %d has no source element", tuple_id);
+			MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
-			if (tuple_id < n_elements)
-			{
-				Pointer		valuePtr = HnswPtrAccess(base, element->value);
+			etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
 
-				tuple_size = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
-				MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
-				HnswSetElementTuple(base, etup, element);
-				ItemPointerSetInvalid(&etup->neighbortid);
-				if (PageGetFreeSpace(page) < tuple_size)
-					elog(ERROR, "AFTP logical page %d exceeds physical capacity",
-						 p);
-				element->blkno = BufferGetBlockNumber(buf);
-				element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
-				offno = PageAddItem(page, (Item) etup, tuple_size,
-									InvalidOffsetNumber, false, false);
-				if (offno != element->offno)
-					elog(ERROR, "failed to add index item to \"%s\"",
-						 RelationGetRelationName(index));
-				has_element = true;
-			}
-			else
-			{
-				tuple_size = HNSW_NEIGHBOR_TUPLE_SIZE(element->level,
-													 buildstate->m);
-				MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);
-				if (PageGetFreeSpace(page) < tuple_size)
-					elog(ERROR, "AFTP logical page %d exceeds physical capacity",
-						 p);
-				element->neighborPage = BufferGetBlockNumber(buf);
-				element->neighborOffno =
-					OffsetNumberNext(PageGetMaxOffsetNumber(page));
-				offno = PageAddItem(page, (Item) ntup, tuple_size,
-									InvalidOffsetNumber, false, false);
-				if (offno != element->neighborOffno)
-					elog(ERROR, "failed to add index item to \"%s\"",
-						 RelationGetRelationName(index));
-				neighbor_entries[element_id].blkno = element->neighborPage;
-				neighbor_entries[element_id].offno = element->neighborOffno;
-				neighbor_entries[element_id].elementId = element_id;
-				has_neighbor = true;
-			}
+			if (etupSize > HNSW_TUPLE_ALLOC_SIZE)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("index tuple too large")));
+
+			HnswSetElementTuple(base, etup, element);
+
+			if (PageGetFreeSpace(epage) < etupSize)
+				HnswBuildAppendPage(index, &ebuf, &epage, forkNum);
+
+			element->blkno = BufferGetBlockNumber(ebuf);
+			element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(epage));
+
+			etuple_blkno[tid] = element->blkno;
+			etuple_offno[tid] = element->offno;
+
+			if (PageAddItem(epage, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
+				elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 		}
 
-		if (has_element)
-			n_element_pages++;
-		if (has_neighbor)
-			n_neighbor_pages++;
-	}
+		insertPage = BufferGetBlockNumber(ebuf);
+		MarkBufferDirty(ebuf);
+		UnlockReleaseBuffer(ebuf);
 
-	insertPage = BufferGetBlockNumber(buf);
-	MarkBufferDirty(buf);
-	UnlockReleaseBuffer(buf);
+		pfree(etuple_blkno);
+		pfree(etuple_offno);
+	}
 	pass1_ms = AftpBuildElapsedMilliseconds(pass_start);
-	elog(INFO, "AFTP timing: packed write Pass 1 element-group placement: %.3f ms",
+	elog(INFO, "AFTP timing: write Pass 1 ElementTuples: %.3f ms",
 		 pass1_ms);
 
-	/* Pass 2: fill NeighborTuple placeholders, grouped by physical page. */
+	/****************************************************
+	 * Pass 2: Write NeighborTuple placeholders in packed order
+	 ****************************************************/
 	INSTR_TIME_SET_CURRENT(pass_start);
-	qsort(neighbor_entries, n_elements, sizeof(AftpTupleWriteEntry),
-		  CompareAftpTupleWrite);
-	for (int idx = 0; idx < n_elements;)
 	{
-		BlockNumber blkno = neighbor_entries[idx].blkno;
+		nbuf = HnswNewBuffer(index, forkNum);
+		npage = BufferGetPage(nbuf);
+		HnswInitPage(nbuf, npage);
 
-		CHECK_FOR_INTERRUPTS();
-		buf = ReadBufferExtended(index, forkNum, blkno, RBM_NORMAL, NULL);
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		page = BufferGetPage(buf);
-		while (idx < n_elements && neighbor_entries[idx].blkno == blkno)
+		for (int i = 0; i < n_neighbors; i++)
 		{
-			HnswElement element = id_to_element[neighbor_entries[idx].elementId];
-			Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level,
-														 buildstate->m);
+			int			tid = buildstate->aftp_ntuple_order[i];
+			HnswElement element = id_to_element[tid];
+			Size		ntupSize;
 
 			MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);
-			HnswSetNeighborTuple(base, ntup, element, buildstate->m);
-			if (!PageIndexTupleOverwrite(page, neighbor_entries[idx].offno,
-										 (Item) ntup, ntupSize))
-				elog(ERROR, "failed to add index item to \"%s\"",
-					 RelationGetRelationName(index));
-			idx++;
+			ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
+
+			if (PageGetFreeSpace(npage) < ntupSize)
+				HnswBuildAppendPage(index, &nbuf, &npage, forkNum);
+
+			element->neighborPage = BufferGetBlockNumber(nbuf);
+			element->neighborOffno = OffsetNumberNext(PageGetMaxOffsetNumber(npage));
+
+			if (PageAddItem(npage, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
+				elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 		}
-		MarkBufferDirty(buf);
-		UnlockReleaseBuffer(buf);
+
+		neighborInsertPage = BufferGetBlockNumber(nbuf);
+		MarkBufferDirty(nbuf);
+		UnlockReleaseBuffer(nbuf);
 	}
 	pass2_ms = AftpBuildElapsedMilliseconds(pass_start);
-	elog(INFO, "AFTP timing: packed write Pass 2 NeighborTuple fill: %.3f ms",
+	elog(INFO, "AFTP timing: write Pass 2 NeighborTuple placeholders: %.3f ms",
 		 pass2_ms);
 
-	/* Pass 3: grouped backfill of ElementTuple.neighbortid. */
+	/****************************************************
+	 * Pass 3: Backfill ElementTuple.neighbortid
+	 *
+	 * Group by blkno, one ReadBuffer per page.
+	 ****************************************************/
 	INSTR_TIME_SET_CURRENT(pass_start);
 	{
-		AftpBackfillSortEntry *entries;
-		int			idx = 0;
+		BackfillSortEntry *entries;
+		int			idx;
 
-		entries = palloc((Size) n_elements * sizeof(AftpBackfillSortEntry));
+		entries = palloc(n_elements * sizeof(BackfillSortEntry));
+
 		for (int i = 0; i < n_elements; i++)
 		{
 			HnswElement element = id_to_element[i];
@@ -553,52 +468,62 @@ CreateGraphPagesPacked(HnswBuildState *buildstate)
 			entries[i].neighborPage = element->neighborPage;
 			entries[i].neighborOffno = element->neighborOffno;
 		}
-		qsort(entries, n_elements, sizeof(AftpBackfillSortEntry),
-			  CompareAftpBackfill);
 
+		/* Sort by blkno so we can process in page groups */
+		qsort(entries, n_elements, sizeof(BackfillSortEntry),
+			  compare_backfill_by_blkno);
+
+		idx = 0;
 		while (idx < n_elements)
 		{
 			BlockNumber blkno = entries[idx].blkno;
+			Buffer		buf;
+			Page		page;
 
 			buf = ReadBufferExtended(index, forkNum, blkno, RBM_NORMAL, NULL);
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 			page = BufferGetPage(buf);
+
 			while (idx < n_elements && entries[idx].blkno == blkno)
 			{
-				ItemId		itemid = PageGetItemId(page, entries[idx].offno);
-				HnswElementTuple current =
-					(HnswElementTuple) PageGetItem(page, itemid);
+				HnswElementTuple cur_etup;
 
-				if (!HnswIsElementTuple(current))
-					elog(ERROR, "AFTP backfill found a non-element tuple");
-				ItemPointerSet(&current->neighbortid,
+				cur_etup = (HnswElementTuple) PageGetItem(page,
+													  PageGetItemId(page, entries[idx].offno));
+				ItemPointerSet(&cur_etup->neighbortid,
 							   entries[idx].neighborPage,
 							   entries[idx].neighborOffno);
 				idx++;
 			}
+
 			MarkBufferDirty(buf);
 			UnlockReleaseBuffer(buf);
 		}
+
 		pfree(entries);
 	}
 	pass3_ms = AftpBuildElapsedMilliseconds(pass_start);
-	elog(INFO, "AFTP timing: packed write Pass 3 neighbortid backfill: %.3f ms",
+	elog(INFO, "AFTP timing: write Pass 3 neighbortid backfill: %.3f ms",
 		 pass3_ms);
 
-	buildstate->aftp_n_epages = n_element_pages;
-	buildstate->aftp_n_npages = n_neighbor_pages;
-	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS,
-					   HnswPtrAccess(base, buildstate->graph->entryPoint),
-					   insertPage, forkNum, true);
+	/* Update metapage */
+	{
+		HnswElement entryPoint;
 
-	elog(INFO, "AFTP timing: packed write total: %.3f ms (E-pages=%d, N-pages=%d)",
-		 AftpBuildElapsedMilliseconds(packed_start), n_element_pages,
-		 n_neighbor_pages);
+		entryPoint = HnswPtrAccess(base, buildstate->graph->entryPoint);
+		HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint,
+						   insertPage, neighborInsertPage,
+						   forkNum, true, HNSW_WRITE_UPDATE_META_ENTRY_POINT);
+	}
+
 	pfree(etup);
 	pfree(ntup);
 	pfree(id_to_element);
-	pfree(neighbor_entries);
-	pfree(seen_tuple);
+
+	elog(INFO, "AFTP timing: packed write passes total: %.3f ms "
+		 "(Pass 1 + Pass 2 + Pass 3: %.3f ms)",
+		 AftpBuildElapsedMilliseconds(packed_start),
+		 pass1_ms + pass2_ms + pass3_ms);
 }
 
 /*
@@ -623,6 +548,7 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 		Buffer		buf;
 		Page		page;
 		Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m);
+		int64		io_before = 0;
 
 		/* Update iterator */
 		iter = element->next;
@@ -634,7 +560,11 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 		/* Needs to be called when no buffer locks are held */
 		CHECK_FOR_INTERRUPTS();
 
+		if (hnsw_io_track)
+			HnswIOCountLayerReadBegin(&io_before);
 		buf = ReadBufferExtended(index, forkNum, element->neighborPage, RBM_NORMAL, NULL);
+		if (hnsw_io_track)
+			HnswIOCountLayerReadEnd(io_before, element->neighborPage);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		page = BufferGetPage(buf);
 
@@ -652,60 +582,109 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 }
 
 /*
- * Flush pages
+ * Flush pages — AFTP-integrated version
+ *
+ * When AFTP is enabled and the dataset is large enough (>= 1000 tuples),
+ * runs the full AFTP pipeline (Phases 1-4), then writes pages in
+ * packed order via CreateGraphPagesPacked().
+ *
+ * On AFTP failure, falls back to the original sequential layout.
  */
 static void
-FlushPages(HnswBuildState * buildstate, bool finalFlush)
+FlushPages(HnswBuildState * buildstate)
 {
-	bool		use_aftp = aftp_enable && buildstate->graph->indtuples > 0;
-	MemoryContext oldCtx = NULL;
+	bool		use_aftp = aftp_enable && buildstate->graph->indtuples >= 1000;
+	bool		packed_layout_written = false;
+	instr_time	aftp_total_start;
+	instr_time	write_start;
 
 #ifdef HNSW_MEMORY
 	elog(INFO, "memory: %zu MB", buildstate->graph->memoryUsed / (1024 * 1024));
 #endif
 
-	if (aftp_enable && !finalFlush)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("AFTP requires the complete HNSW graph to fit in maintenance_work_mem"),
-				 errdetail("The in-memory graph filled after " INT64_FORMAT " tuples.",
-						   (int64) buildstate->graph->indtuples),
-				 errhint("Increase maintenance_work_mem or disable hnsw.aftp_enable.")));
-
-	buildstate->aftp_status = use_aftp ? AFTP_BUILD_IN_PROGRESS :
-		AFTP_BUILD_NOT_STARTED;
 	CreateMetaPage(buildstate);
 
 	if (use_aftp)
 	{
-		AftpConfig cfg;
+		MemoryContext oldCtx;
 
-		buildstate->aftp_context = AllocSetContextCreate(buildstate->graphCtx,
-											 "AFTP build context",
-											 ALLOCSET_DEFAULT_SIZES);
+		INSTR_TIME_SET_CURRENT(aftp_total_start);
+
+		/* Create AFTP dedicated MemoryContext */
+		buildstate->aftp_context = AllocSetContextCreate(
+			buildstate->graphCtx,
+			"AFTP build context",
+			ALLOCSET_DEFAULT_SIZES);
+
 		oldCtx = MemoryContextSwitchTo(buildstate->aftp_context);
-		AftpPopulateConfig(&cfg);
-		if (!AftpMain(buildstate, &cfg))
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("AFTP failed to produce a packed layout")));
 
-		UpdateAftpMetaPage(buildstate, AFTP_BUILD_FLUSHING);
-		CreateGraphPagesPacked(buildstate);
+		PG_TRY();
+		{
+			AftpConfig cfg;
+
+			/* Mark AFTP in progress in metapage */
+			buildstate->aftp_status = AFTP_BUILD_IN_PROGRESS;
+
+			/* Populate config and run AFTP pipeline */
+			AftpPopulateConfig(&cfg);
+			AftpMain(buildstate, &cfg);
+
+			/* Mark flushing in progress */
+			buildstate->aftp_status = AFTP_BUILD_FLUSHING;
+
+			/* Write pages in packed order */
+			CreateGraphPagesPacked(buildstate);
+			packed_layout_written = true;
+
+			/* Mark complete */
+			buildstate->aftp_status = AFTP_BUILD_COMPLETED;
+		}
+		PG_CATCH();
+		{
+			/* Clean up AFTP resources */
+			MemoryContextSwitchTo(oldCtx);
+			MemoryContextDelete(buildstate->aftp_context);
+			buildstate->aftp_etuple_page = NULL;
+			buildstate->aftp_ntuple_page = NULL;
+			buildstate->aftp_etuple_order = NULL;
+			buildstate->aftp_ntuple_order = NULL;
+			buildstate->aftp_context = NULL;
+
+			/* Fall back to original layout */
+			elog(WARNING, "AFTP build failed, falling back to default layout");
+			buildstate->aftp_status = AFTP_BUILD_NOT_STARTED;
+
+			/* Flush error state */
+			FlushErrorState();
+
+			/* Use original CreateGraphPages */
+			CreateGraphPages(buildstate);
+		}
+		PG_END_TRY();
+
+		/* Switch back and clean up */
+		MemoryContextSwitchTo(oldCtx);
+		if (buildstate->aftp_context != NULL)
+			MemoryContextDelete(buildstate->aftp_context);
+		buildstate->aftp_context = NULL;
 	}
 	else
-		CreateGraphPages(buildstate);
-
-	/* The packed writer performs its own grouped NeighborTuple fill pass. */
-	if (!use_aftp)
-		WriteNeighborTuples(buildstate);
-
-	if (use_aftp)
 	{
-		UpdateAftpMetaPage(buildstate, AFTP_BUILD_COMPLETED);
-		MemoryContextSwitchTo(oldCtx);
-		MemoryContextDelete(buildstate->aftp_context);
-		buildstate->aftp_context = NULL;
+		/* AFTP disabled or dataset too small: use original layout */
+		CreateGraphPages(buildstate);
+	}
+
+	if (packed_layout_written)
+		INSTR_TIME_SET_CURRENT(write_start);
+
+	WriteNeighborTuples(buildstate);
+
+	if (packed_layout_written)
+	{
+		elog(INFO, "AFTP timing: NeighborTuple payload fill: %.3f ms",
+			 AftpBuildElapsedMilliseconds(write_start));
+		elog(INFO, "AFTP timing: end-to-end optimization and write: %.3f ms",
+			 AftpBuildElapsedMilliseconds(aftp_total_start));
 	}
 
 	buildstate->graph->flushed = true;
@@ -934,7 +913,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 					 errdetail("Building will take significantly more time."),
 					 errhint("Increase maintenance_work_mem to speed up builds.")));
 
-			FlushPages(buildstate, false);
+			FlushPages(buildstate);
 		}
 
 		LWLockRelease(flushLock);
@@ -1124,14 +1103,6 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswleader = NULL;
 	buildstate->hnswshared = NULL;
 	buildstate->hnswarea = NULL;
-	buildstate->aftp_tuple_order = NULL;
-	buildstate->aftp_page_starts = NULL;
-	buildstate->aftp_n_tuples = 0;
-	buildstate->aftp_n_pages = 0;
-	buildstate->aftp_n_epages = 0;
-	buildstate->aftp_n_npages = 0;
-	buildstate->aftp_context = NULL;
-	buildstate->aftp_status = AFTP_BUILD_NOT_STARTED;
 }
 
 /*
@@ -1191,6 +1162,11 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
 	/* Join parallel scan */
 	indexInfo = BuildIndexInfo(indexRel);
 	indexInfo->ii_Concurrent = hnswshared->isconcurrent;
+
+	/* Init page dedup set for this parallel worker */
+	indexInfo->ii_AmCache = palloc0(sizeof(HnswIOPageSet));
+	hnsw_io_page_set = (HnswIOPageSet *) indexInfo->ii_AmCache;
+
 	InitBuildState(&buildstate, heapRel, indexRel, indexInfo, MAIN_FORKNUM);
 	buildstate.graph = &hnswshared->graphData;
 	buildstate.hnswarea = hnswarea;
@@ -1216,6 +1192,7 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
 	/* Notify leader */
 	ConditionVariableSignal(&hnswshared->workersdonecv);
 
+	hnsw_io_page_set = NULL;
 	FreeBuildState(&buildstate);
 }
 
@@ -1500,7 +1477,7 @@ BuildGraph(HnswBuildState * buildstate, ForkNumber forkNum)
 
 	/* Flush pages */
 	if (!buildstate->graph->flushed)
-		FlushPages(buildstate, true);
+		FlushPages(buildstate);
 
 	/* End parallel build */
 	if (buildstate->hnswleader)
@@ -1537,7 +1514,12 @@ hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	IndexBuildResult *result;
 	HnswBuildState buildstate;
 
+	/* Init page dedup set for this build */
+	hnsw_io_page_set = palloc0(sizeof(HnswIOPageSet));
+
 	BuildIndex(heap, index, indexInfo, &buildstate, MAIN_FORKNUM);
+
+	hnsw_io_page_set = NULL;
 
 	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
 	result->heap_tuples = buildstate.reltuples;
@@ -1555,5 +1537,10 @@ hnswbuildempty(Relation index)
 	IndexInfo  *indexInfo = BuildIndexInfo(index);
 	HnswBuildState buildstate;
 
+	/* Init page dedup set for this build */
+	hnsw_io_page_set = palloc0(sizeof(HnswIOPageSet));
+
 	BuildIndex(NULL, index, indexInfo, &buildstate, INIT_FORKNUM);
+
+	hnsw_io_page_set = NULL;
 }

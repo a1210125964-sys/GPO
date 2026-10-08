@@ -1,0 +1,137 @@
+-- ============================================================
+-- HNSW Per-Layer Read Statistics -- Regression Tests
+-- ============================================================
+-- Setup
+SET hnsw.io_layer_track = on;
+SELECT setseed(0.5);
+ setseed 
+---------
+ 
+(1 row)
+
+DROP TABLE IF EXISTS test_layer_stats CASCADE;
+NOTICE:  table "test_layer_stats" does not exist, skipping
+CREATE TABLE test_layer_stats (id serial, embedding vector(128));
+WARNING:  invalid configuration parameter name "hnsw.io_layer_track", removing it
+LINE 1: ...EATE TABLE test_layer_stats (id serial, embedding vector(128...
+                                                             ^
+DETAIL:  "hnsw" is now a reserved prefix.
+-- Test 1: Reset clears all counters + GUC visibility (L2)
+SHOW hnsw.io_layer_track;  -- Expected: on
+ hnsw.io_layer_track 
+---------------------
+ on
+(1 row)
+
+SELECT hnsw_io_stats_reset();
+ hnsw_io_stats_reset 
+---------------------
+ 
+(1 row)
+
+SELECT count(*) AS empty_layers FROM hnsw_io_layer_stats();
+ empty_layers 
+--------------
+            0
+(1 row)
+
+-- Expected: 0
+-- Test 2: INSERT triggers per-layer statistics
+CREATE INDEX ON test_layer_stats USING hnsw (embedding vector_l2_ops) WITH (m = 16);
+INSERT INTO test_layer_stats (embedding)
+SELECT (SELECT array_agg(random()::real)::vector FROM generate_series(1,128))
+FROM generate_series(1,100);
+-- Verify: at least one layer has non-zero counts
+SELECT count(*) > 0 AS has_layer_data FROM hnsw_io_layer_stats();
+ has_layer_data 
+----------------
+ t
+(1 row)
+
+-- Test 3: Invariant -- io_read_pages <= buffer_read_pages for every row
+SELECT count(*) = 0 AS io_le_buffer_invariant
+FROM hnsw_io_layer_stats()
+WHERE io_read_pages > buffer_read_pages;
+ io_le_buffer_invariant 
+------------------------
+ t
+(1 row)
+
+-- Test 4: Invariant -- sum of per-layer buffer reads <= global read_pages
+SELECT
+  (SELECT coalesce(sum(buffer_read_pages), 0) FROM hnsw_io_layer_stats()) <= read_pages
+  AS layer_le_global
+FROM hnsw_io_stats();
+ layer_le_global 
+-----------------
+ t
+(1 row)
+
+-- Test 5: SCAN/query triggers per-layer statistics
+SELECT hnsw_io_stats_reset();
+ hnsw_io_stats_reset 
+---------------------
+ 
+(1 row)
+
+SELECT count(*) AS scan_result_count FROM (
+  SELECT id FROM test_layer_stats
+  ORDER BY embedding <-> (SELECT embedding FROM test_layer_stats WHERE id = 1)::vector
+  LIMIT 10
+) sub;
+ scan_result_count 
+-------------------
+                10
+(1 row)
+
+SELECT count(*) > 0 AS scan_has_layer_data FROM hnsw_io_layer_stats();
+ scan_has_layer_data 
+---------------------
+ t
+(1 row)
+
+-- Test 6: GUC off disables per-layer counting
+SELECT hnsw_io_stats_reset();
+ hnsw_io_stats_reset 
+---------------------
+ 
+(1 row)
+
+SET hnsw.io_layer_track = off;
+INSERT INTO test_layer_stats (embedding)
+SELECT (SELECT array_agg(random()::real)::vector FROM generate_series(1,128))
+FROM generate_series(1,10);
+-- With GUC off, per-layer stats should still be empty
+SELECT count(*) = 0 AS guc_off_no_layer_stats FROM hnsw_io_layer_stats();
+ guc_off_no_layer_stats 
+------------------------
+ t
+(1 row)
+
+-- But global counters should still increment
+SELECT read_pages > 0 AS global_still_counts FROM hnsw_io_stats();
+ global_still_counts 
+---------------------
+ t
+(1 row)
+
+SET hnsw.io_layer_track = on;
+-- Test 7: Cache hit rate sanity check
+SELECT hnsw_io_stats_reset();
+ hnsw_io_stats_reset 
+---------------------
+ 
+(1 row)
+
+INSERT INTO test_layer_stats (embedding)
+SELECT (SELECT array_agg(random()::real)::vector FROM generate_series(1,128))
+FROM generate_series(1,20);
+-- Verify nonzero buffer reads
+SELECT sum(buffer_read_pages) > 0 AS has_buffer_reads FROM hnsw_io_layer_stats();
+ has_buffer_reads 
+------------------
+ t
+(1 row)
+
+-- Cleanup
+DROP TABLE test_layer_stats CASCADE;
