@@ -24,6 +24,10 @@
 #define HNSW_MAGIC_NUMBER 0xA953A953
 #define HNSW_PAGE_ID	0xFF90
 
+/* AFTP keeps the native tuple format and marks only its packed placement. */
+#define HNSW_AFTP_MAGIC_NUMBER 0x41465450U
+#define HNSW_AFTP_STORAGE_VERSION 2
+
 /* Preserved page numbers */
 #define HNSW_METAPAGE_BLKNO	0
 #define HNSW_HEAD_BLKNO		1	/* first element page */
@@ -263,6 +267,9 @@ typedef struct HnswQuery
 	Datum		value;
 }			HnswQuery;
 
+typedef struct HnswBuildState HnswBuildState;
+#include "hnswaftp.h"
+
 typedef struct HnswBuildState
 {
 	/* Info */
@@ -299,6 +306,16 @@ typedef struct HnswBuildState
 	HnswLeader *hnswleader;
 	HnswShared *hnswshared;
 	char	   *hnswarea;
+
+	/* Unified AFTP packing results and their dedicated allocation context. */
+	int		   *aftp_tuple_order;
+	int		   *aftp_page_starts;
+	int			aftp_n_tuples;
+	int			aftp_n_pages;
+	int			aftp_n_epages;
+	int			aftp_n_npages;
+	MemoryContext aftp_context;
+	AftpBuildStatus aftp_status;
 }			HnswBuildState;
 
 typedef struct HnswMetaPageData
@@ -312,6 +329,16 @@ typedef struct HnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;
 	BlockNumber insertPage;
+
+	/* Appended extension marker; zeroed for the native layout. */
+	uint32		aftpMagicNumber;
+	uint16		aftpStorageVersion;
+	uint8		aftpBuildStatus;
+	uint8		aftpReserved;
+	/* Every AFTP page pairs both tuple types, so both counts equal the
+	 * total page count. */
+	uint32		aftpElementPages;
+	uint32		aftpNeighborPages;
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;

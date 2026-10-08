@@ -93,6 +93,51 @@ HnswInit(void)
 							 NULL, &hnsw_scan_mem_multiplier,
 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("hnsw.aftp_enable",
+		"Enables AFTP packed layout during index build.",
+		NULL, &aftp_enable, true,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.aftp_sample_queries",
+		"Number of sample queries for AFTP trace collection.",
+		NULL, &aftp_sample_queries, 200, 10, 2000,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.aftp_ef_search",
+		"Search breadth used while collecting AFTP traces.",
+		NULL, &aftp_ef_search, 64, 1, 1000,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.aftp_window",
+		"Co-visit window used to build AFTP affinities.",
+		NULL, &aftp_window, 100, 10, 1000,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.aftp_top_affinity",
+		"Number of strongest affinities retained per tuple after exact accumulation.",
+		NULL, &aftp_top_affinity, 20, 5, 200,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.aftp_refine_iterations",
+		"Number of AFTP refinement iterations (zero skips Phase 4).",
+		NULL, &aftp_refine_iterations, 5, 0, 50,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable("hnsw.aftp_decay_lambda",
+		"AFTP time-decay constant (zero derives it from the window).",
+		NULL, &aftp_decay_lambda, 0.0, 0.0, 10000.0,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.aftp_seed_softmax",
+		"AFTP seed softmax pool size (zero is deterministic).",
+		NULL, &aftp_seed_softmax, 10, 0, 100,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.aftp_max_memory",
+		"AFTP memory limit in MB (zero uses an automatic limit).",
+		NULL, &aftp_max_memory, 0, 0, 65536,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("hnsw");
 }
 

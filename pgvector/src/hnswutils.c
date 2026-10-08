@@ -304,6 +304,52 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
 		elog(ERROR, "hnsw index is not valid");
 
+	if (unlikely(metap->version != HNSW_VERSION))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("hnsw index storage version mismatch"),
+				 errdetail("Index \"%s\" uses storage version %u, but this server expects version %u.",
+						   RelationGetRelationName(index), metap->version,
+						   HNSW_VERSION),
+				 errhint("REINDEX the index with the current vector extension.")));
+
+	/*
+	 * Old native v0.8.0 metapages end at insertPage.  Only inspect the
+	 * appended AFTP marker when pd_lower proves those bytes are part of the
+	 * metapage, so old native indexes cannot be mistaken for packed indexes.
+	 */
+	if (((PageHeader) page)->pd_lower >=
+		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page)
+	{
+		if (metap->aftpMagicNumber == HNSW_AFTP_MAGIC_NUMBER)
+		{
+			if (unlikely(metap->aftpStorageVersion != HNSW_AFTP_STORAGE_VERSION))
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("unsupported AFTP storage version %u",
+								metap->aftpStorageVersion),
+						 errhint("REINDEX the index with the current vector extension.")));
+			if (unlikely(metap->aftpBuildStatus != AFTP_BUILD_COMPLETED))
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("AFTP index build is incomplete"),
+						 errdetail("Index \"%s\" has AFTP build status %u.",
+								   RelationGetRelationName(index),
+								   metap->aftpBuildStatus),
+						 errhint("REINDEX the index.")));
+		}
+		else if (unlikely(metap->aftpMagicNumber != 0 ||
+						   metap->aftpStorageVersion != 0 ||
+						   metap->aftpBuildStatus != AFTP_BUILD_NOT_STARTED ||
+						   metap->aftpElementPages != 0 ||
+						   metap->aftpNeighborPages != 0))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("invalid AFTP marker in hnsw index \"%s\"",
+							RelationGetRelationName(index)),
+					 errhint("REINDEX the index.")));
+	}
+
 	if (m != NULL)
 		*m = metap->m;
 
