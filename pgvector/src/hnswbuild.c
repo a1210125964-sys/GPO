@@ -132,41 +132,51 @@ HnswBuildAppendPage(Relation index, Buffer *buf, Page *page, ForkNumber forkNum)
 }
 
 /*
- * Create graph pages
+ * Create graph pages — centralized NeighborTuple version
+ *
+ * Maintains two independent page chains:
+ *   1. ElementTuple chain (ebuf/epage) — only ElementTuples
+ *   2. NeighborTuple chain (nbuf/npage) — only NeighborTuples
+ *
+ * ElementTuple.neighbortid → (neighborPage, neighborOffno)
+ * points to the centralized NeighborTuple page chain.
  */
 static void
 CreateGraphPages(HnswBuildState * buildstate)
 {
 	Relation	index = buildstate->index;
 	ForkNumber	forkNum = buildstate->forkNum;
-	Size		maxSize;
 	HnswElementTuple etup;
 	HnswNeighborTuple ntup;
 	BlockNumber insertPage;
+	BlockNumber neighborInsertPage;
 	HnswElement entryPoint;
-	Buffer		buf;
-	Page		page;
+	Buffer		ebuf;		/* ElementTuple page buffer */
+	Page		epage;		/* ElementTuple page */
+	Buffer		nbuf;		/* NeighborTuple page buffer (centralized pool) */
+	Page		npage;		/* NeighborTuple page (centralized pool) */
 	HnswElementPtr iter = buildstate->graph->head;
 	char	   *base = buildstate->hnswarea;
-
-	/* Calculate sizes */
-	maxSize = HNSW_MAX_SIZE;
 
 	/* Allocate once */
 	etup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
 	ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
 
-	/* Prepare first page */
-	buf = HnswNewBuffer(index, forkNum);
-	page = BufferGetPage(buf);
-	HnswInitPage(buf, page);
+	/* Prepare first ElementTuple page */
+	ebuf = HnswNewBuffer(index, forkNum);
+	epage = BufferGetPage(ebuf);
+	HnswInitPage(ebuf, epage);
+
+	/* Prepare first NeighborTuple page (centralized pool) */
+	nbuf = HnswNewBuffer(index, forkNum);
+	npage = BufferGetPage(nbuf);
+	HnswInitPage(nbuf, npage);
 
 	while (!HnswPtrIsNull(base, iter))
 	{
 		HnswElement element = HnswPtrAccess(base, iter);
 		Size		etupSize;
 		Size		ntupSize;
-		Size		combinedSize;
 		Pointer		valuePtr = HnswPtrAccess(base, element->value);
 
 		/* Update iterator */
@@ -178,7 +188,6 @@ CreateGraphPages(HnswBuildState * buildstate)
 		/* Calculate sizes */
 		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
-		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
 		/* Initial size check */
 		if (etupSize > HNSW_TUPLE_ALLOC_SIZE)
@@ -188,47 +197,53 @@ CreateGraphPages(HnswBuildState * buildstate)
 
 		HnswSetElementTuple(base, etup, element);
 
-		/* Keep element and neighbors on the same page if possible */
-		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
-			HnswBuildAppendPage(index, &buf, &page, forkNum);
+		/*
+		 * ElementTuple: write to ElementTuple page chain.
+		 * Append new ElementTuple page when out of space.
+		 */
+		if (PageGetFreeSpace(epage) < etupSize)
+			HnswBuildAppendPage(index, &ebuf, &epage, forkNum);
 
-		/* Calculate offsets */
-		element->blkno = BufferGetBlockNumber(buf);
-		element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
-		if (combinedSize <= maxSize)
-		{
-			element->neighborPage = element->blkno;
-			element->neighborOffno = OffsetNumberNext(element->offno);
-		}
-		else
-		{
-			element->neighborPage = element->blkno + 1;
-			element->neighborOffno = FirstOffsetNumber;
-		}
+		element->blkno = BufferGetBlockNumber(ebuf);
+		element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(epage));
+
+		/*
+		 * NeighborTuple: write to centralized NeighborTuple page chain.
+		 * Append new NeighborTuple page when out of space.
+		 */
+		if (PageGetFreeSpace(npage) < ntupSize)
+			HnswBuildAppendPage(index, &nbuf, &npage, forkNum);
+
+		element->neighborPage = BufferGetBlockNumber(nbuf);
+		element->neighborOffno = OffsetNumberNext(PageGetMaxOffsetNumber(npage));
 
 		ItemPointerSet(&etup->neighbortid, element->neighborPage, element->neighborOffno);
 
-		/* Add element */
-		if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
+		/* Add element to ElementTuple page */
+		if (PageAddItem(epage, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 
-		/* Add new page if needed */
-		if (PageGetFreeSpace(page) < ntupSize)
-			HnswBuildAppendPage(index, &buf, &page, forkNum);
-
-		/* Add placeholder for neighbors */
-		if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
+		/* Add neighbor placeholder to centralized NeighborTuple page */
+		if (PageAddItem(npage, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 	}
 
-	insertPage = BufferGetBlockNumber(buf);
+	insertPage = BufferGetBlockNumber(ebuf);
+	neighborInsertPage = BufferGetBlockNumber(nbuf);
 
-	/* Commit */
-	MarkBufferDirty(buf);
-	UnlockReleaseBuffer(buf);
+	/* Commit ElementTuple page chain */
+	MarkBufferDirty(ebuf);
+	UnlockReleaseBuffer(ebuf);
+
+	/* Commit NeighborTuple page chain */
+	MarkBufferDirty(nbuf);
+	UnlockReleaseBuffer(nbuf);
 
 	entryPoint = HnswPtrAccess(base, buildstate->graph->entryPoint);
-	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint, insertPage, forkNum, true);
+	/* Pass actual neighborInsertPage to metapage */
+	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint,
+	                   insertPage, neighborInsertPage,
+	                   forkNum, true, HNSW_WRITE_UPDATE_META_ENTRY_POINT);
 
 	pfree(etup);
 	pfree(ntup);
@@ -256,6 +271,7 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 		Buffer		buf;
 		Page		page;
 		Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m);
+		int64		io_before = 0;
 
 		/* Update iterator */
 		iter = element->next;
@@ -267,7 +283,11 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 		/* Needs to be called when no buffer locks are held */
 		CHECK_FOR_INTERRUPTS();
 
+		if (hnsw_io_track)
+			HnswIOCountLayerReadBegin(&io_before);
 		buf = ReadBufferExtended(index, forkNum, element->neighborPage, RBM_NORMAL, NULL);
+		if (hnsw_io_track)
+			HnswIOCountLayerReadEnd(io_before, element->neighborPage);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		page = BufferGetPage(buf);
 
@@ -773,6 +793,11 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
 	/* Join parallel scan */
 	indexInfo = BuildIndexInfo(indexRel);
 	indexInfo->ii_Concurrent = hnswshared->isconcurrent;
+
+	/* Init page dedup set for this parallel worker */
+	indexInfo->ii_AmCache = palloc0(sizeof(HnswIOPageSet));
+	hnsw_io_page_set = (HnswIOPageSet *) indexInfo->ii_AmCache;
+
 	InitBuildState(&buildstate, heapRel, indexRel, indexInfo, MAIN_FORKNUM);
 	buildstate.graph = &hnswshared->graphData;
 	buildstate.hnswarea = hnswarea;
@@ -798,6 +823,7 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
 	/* Notify leader */
 	ConditionVariableSignal(&hnswshared->workersdonecv);
 
+	hnsw_io_page_set = NULL;
 	FreeBuildState(&buildstate);
 }
 
@@ -1119,7 +1145,12 @@ hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	IndexBuildResult *result;
 	HnswBuildState buildstate;
 
+	/* Init page dedup set for this build */
+	hnsw_io_page_set = palloc0(sizeof(HnswIOPageSet));
+
 	BuildIndex(heap, index, indexInfo, &buildstate, MAIN_FORKNUM);
+
+	hnsw_io_page_set = NULL;
 
 	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
 	result->heap_tuples = buildstate.reltuples;
@@ -1137,5 +1168,10 @@ hnswbuildempty(Relation index)
 	IndexInfo  *indexInfo = BuildIndexInfo(index);
 	HnswBuildState buildstate;
 
+	/* Init page dedup set for this build */
+	hnsw_io_page_set = palloc0(sizeof(HnswIOPageSet));
+
 	BuildIndex(NULL, index, indexInfo, &buildstate, INIT_FORKNUM);
+
+	hnsw_io_page_set = NULL;
 }

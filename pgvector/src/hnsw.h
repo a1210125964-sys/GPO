@@ -11,6 +11,7 @@
 #include "utils/relptr.h"
 #include "utils/sampling.h"
 #include "vector.h"
+#include "pgstat.h"
 
 #define HNSW_MAX_DIM 2000
 #define HNSW_MAX_NNZ 1000
@@ -113,6 +114,62 @@ extern int	hnsw_iterative_scan;
 extern int	hnsw_max_scan_tuples;
 extern double hnsw_scan_mem_multiplier;
 extern int	hnsw_lock_tranche_id;
+
+/* I/O statistics tracking */
+#define HNSW_IO_MAX_TRACKED_PAGES 512
+
+/* Per-layer read statistics */
+#define HNSW_MAX_TRACKED_LEVELS 256
+
+typedef struct HnswIOPageSet
+{
+	int			npages;
+	BlockNumber pages[HNSW_IO_MAX_TRACKED_PAGES];
+	bool		overflow;
+} HnswIOPageSet;
+
+extern bool	hnsw_io_track;
+extern int64 hnsw_io_read_pages;
+extern int64 hnsw_io_write_pages;
+extern int64 hnsw_io_total_ios;
+extern int64 hnsw_io_updated_pages;
+extern HnswIOPageSet *hnsw_io_page_set;
+extern int	hnsw_io_current_layer;
+extern int64 hnsw_io_layer_buffer_reads[HNSW_MAX_TRACKED_LEVELS];
+extern int64 hnsw_io_layer_io_reads[HNSW_MAX_TRACKED_LEVELS];
+extern bool	hnsw_io_layer_track;
+/*
+ * Per-session sequential/random read statistics.
+ *
+ * IMPORTANT: hnsw_io_last_block MUST ONLY be modified inside
+ * HnswIOCountSeqRandRead().  External code must never write to
+ * this variable directly -- the GUC guard (Rule 6) and seq/rand
+ * classification logic depend on single-writer discipline.
+ */
+extern BlockNumber hnsw_io_last_block;
+extern bool		hnsw_io_seq_rand_track;
+extern int64	hnsw_io_seq_buffer_reads;
+extern int64	hnsw_io_seq_io_reads;
+extern int64	hnsw_io_rand_buffer_reads;
+extern int64	hnsw_io_rand_io_reads;
+extern int64	hnsw_io_first_buffer_reads;
+extern int64	hnsw_io_first_io_reads;
+extern void	HnswIOStatInit(void);
+extern bool HnswIOMarkPageUpdated(BlockNumber blkno);
+
+/* Write reason classification for detailed write amplification analysis */
+typedef enum HnswWriteReason
+{
+	HNSW_WRITE_ADD_ELEMENT,				/* Write new element + neighbor tuples */
+	HNSW_WRITE_UPDATE_NEIGHBOR,			/* Update existing neighbor's connection list */
+	HNSW_WRITE_UPDATE_META_INSERT_PAGE,	/* Update metapage: insert page changed */
+	HNSW_WRITE_UPDATE_META_ENTRY_POINT,	/* Update metapage: entry point upgraded */
+	HNSW_WRITE_ADD_DUPLICATE,			/* Append heap TID to existing element */
+	HNSW_WRITE_NREASONS					/* Must be last — array size sentinel */
+} HnswWriteReason;
+
+extern const char *hnsw_io_write_reason_names[];
+extern int64 hnsw_io_write_reason_counts[HNSW_WRITE_NREASONS];
 
 typedef enum HnswIterativeScanMode
 {
@@ -312,6 +369,7 @@ typedef struct HnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;
 	BlockNumber insertPage;
+	BlockNumber neighborInsertPage;
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -425,7 +483,7 @@ HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int m
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
 void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
 HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement em, HnswQuery * q, Relation rel, HnswSupport * support, bool loadVec);
-void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
+void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, BlockNumber neighborInsertPage, ForkNumber forkNum, bool building, HnswWriteReason reason);
 void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
 void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
 HnswNeighborArray *HnswInitNeighborArray(int lm, HnswAllocator * allocator);
@@ -508,4 +566,127 @@ typedef struct OffsetHashEntry
 #define SH_DECLARE
 #include "lib/simplehash.h"
 
+/*
+ * HnswIOCountLayerReadBegin / HnswIOCountLayerReadEnd
+ *
+ * Pair of helpers for per-layer read I/O statistics.
+ * Must be called around every ReadBuffer() site that participates
+ * in graph-traversal reads:
+ *
+ *   int64 io_before = 0;
+ *   if (hnsw_io_track)
+ *       HnswIOCountLayerReadBegin(&io_before);
+ *   buf = ReadBuffer(index, blkno);   -- EXACTLY ONE ReadBuffer between Begin/End
+ *   if (hnsw_io_track)
+ *       HnswIOCountLayerReadEnd(io_before, blkno);
+ *
+ *   CONSTRAINT: No other ReadBuffer (or any operation that may
+ *   increment pgBufferUsage.shared_blks_read) must occur between
+ *   Begin and End.  The io_before snapshot is only valid for the
+ *   immediately following ReadBuffer call.
+ *
+ *   Even when hnsw_io_track is false, io_before is declared (and
+ *   initialised to 0) so that the variable is in scope for the
+ *   End call.  The compiler will eliminate the dead stores.
+ *
+ * IO detection: snapshots pgBufferUsage.shared_blks_read before
+ * ReadBuffer() and compares after.  If the counter incremented,
+ * a physical disk read occurred.
+ *
+ * The caller must set hnsw_io_current_layer to the active search
+ * layer (>= 0) before the ReadBuffer.  Layer -1 means "no layer
+ * context" (e.g. metapage reads) and skips per-layer counting.
+ */
+static inline void
+HnswIOCountLayerReadBegin(int64 *io_before)
+{
+#if PG_VERSION_NUM >= 140000
+	*io_before = pgBufferUsage.shared_blks_read;
+#else
+	/*
+	 * PG <= 13: pgBufferUsage is a plain PgStat_Counter, not a struct.
+	 * Fall back to counting every ReadBuffer as a physical read (safe
+	 * over-count; the io_reads <= buffer_reads invariant still holds).
+	 */
+	*io_before = 0;
+#endif
+}
+
+/*
+ * Classification helper for sequential/random/first read detection.
+ * Called inside HnswIOCountLayerReadEnd so every ReadBuffer() site
+ * that uses the Begin/End pattern gets seq/rand stats automatically.
+ */
+static inline void
+HnswIOCountSeqRandRead(BlockNumber blkno, bool is_physical_io)
+{
+	/* Gated by independent GUC */
+	if (!hnsw_io_seq_rand_track)
+		return;
+
+	/* First read: no predecessor block */
+	if (hnsw_io_last_block == InvalidBlockNumber)
+	{
+		hnsw_io_first_buffer_reads++;
+		if (is_physical_io)
+			hnsw_io_first_io_reads++;
+	}
+	/* Sequential: consecutive ascending or descending
+	 * (SSD performance is symmetric for forward/reverse) */
+	else if (blkno == hnsw_io_last_block + 1 ||
+			 blkno == hnsw_io_last_block - 1)
+	{
+		hnsw_io_seq_buffer_reads++;
+		if (is_physical_io)
+			hnsw_io_seq_io_reads++;
+	}
+	/* Random: everything else */
+	else
+	{
+		hnsw_io_rand_buffer_reads++;
+		if (is_physical_io)
+			hnsw_io_rand_io_reads++;
+	}
+
+	/* Track predecessor regardless of classification */
+	hnsw_io_last_block = blkno;
+}
+
+static inline void
+HnswIOCountLayerReadEnd(int64 io_before, BlockNumber blkno)
+{
+	bool		is_physical_io = false;
+
+	/* Global counters always updated (backward compatible) */
+	hnsw_io_read_pages++;
+	hnsw_io_total_ios++;
+
+#if PG_VERSION_NUM >= 140000
+	if (pgBufferUsage.shared_blks_read > io_before)
+		is_physical_io = true;
+#else
+	/*
+	 * PG <= 13 fallback: treat every ReadBuffer as physical I/O.
+	 * This over-counts but preserves the invariant
+	 * io_reads == buffer_reads (cache miss rate = 100%).
+	 */
+	is_physical_io = true;
+#endif
+
+	/* Sequential/random classification (gated by own GUC internally) */
+	HnswIOCountSeqRandRead(blkno, is_physical_io);
+
+	/* Per-layer tracking: gated by GUC + layer context */
+	if (!hnsw_io_layer_track)
+		return;
+
+	if (hnsw_io_current_layer >= 0 &&
+		hnsw_io_current_layer < HNSW_MAX_TRACKED_LEVELS)
+	{
+		hnsw_io_layer_buffer_reads[hnsw_io_current_layer]++;
+
+		if (is_physical_io)
+			hnsw_io_layer_io_reads[hnsw_io_current_layer]++;
+	}
+}
 #endif
