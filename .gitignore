@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Build artifacts (worktree, postgres install, clusters)
+build/
+
+# Benchmark outputs (regenerate with ./run_all.sh)
+results/*
+!results/.gitkeep
+
+# Datasets: only Deep100K ships with the repository
+data/*
+!data/Deep100K/
+!data/queries/
+data/queries/*
+!data/queries/Deep100K/
+
+# Local documentation (kept out of version control)
+docs/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,9 @@
+# Python dependencies for the GPO benchmark suite (bench/ and run_all.sh).
+# Versions are the ones the experiments were run with; newer compatible
+# versions generally work as well.
+numpy>=2.2
+pyarrow>=24.0
+psutil>=7.0
+psycopg2-binary>=2.9
+matplotlib>=3.10
+pandas>=2.3
