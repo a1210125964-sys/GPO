@@ -285,7 +285,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
 			 * point is outdated and empty, the entry point will be empty
 			 * until an element is repaired.
 			 */
-			HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, highestPoint, InvalidBlockNumber, MAIN_FORKNUM, false);
+			HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, highestPoint, InvalidBlockNumber, MAIN_FORKNUM, false, HNSW_WRITE_UPDATE_META_ENTRY_POINT);
 		}
 		else
 		{
@@ -418,7 +418,7 @@ RepairGraph(HnswVacuumState * vacuumstate)
 			 * was replaced and highest point was outdated.
 			 */
 			if (entryPoint == NULL || element->level > entryPoint->level)
-				HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM, false);
+				HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM, false, HNSW_WRITE_UPDATE_META_ENTRY_POINT);
 
 			/* Release lock */
 			UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
@@ -561,7 +561,7 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 	}
 
 	/* Update insert page last, after everything has been marked as deleted */
-	HnswUpdateMetaPage(index, 0, NULL, insertPage, MAIN_FORKNUM, false);
+	HnswUpdateMetaPage(index, 0, NULL, insertPage, MAIN_FORKNUM, false, HNSW_WRITE_UPDATE_META_INSERT_PAGE);
 }
 
 /*

@@ -47,6 +47,7 @@ _PG_init(void)
 	BitvecInit();
 	HalfvecInit();
 	HnswInit();
+	HnswIOStatInit();   /* register HNSW per-layer I/O statistics GUC */
 	IvfflatInit();
 }
 

@@ -20,6 +20,11 @@ GetInsertPage(Relation index)
 	HnswMetaPage metap;
 	BlockNumber insertPage;
 
+	if (hnsw_io_track)
+	{
+		hnsw_io_read_pages++;
+		hnsw_io_total_ios++;
+	}
 	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
@@ -69,6 +74,11 @@ HnswFreeOffset(Relation index, Buffer buf, Page page, HnswElement element, Size 
 			}
 			else
 			{
+				if (hnsw_io_track)
+				{
+					hnsw_io_read_pages++;
+					hnsw_io_total_ios++;
+				}
 				*nbuf = ReadBuffer(index, neighborPage);
 				LockBuffer(*nbuf, BUFFER_LOCK_EXCLUSIVE);
 
@@ -117,6 +127,11 @@ HnswInsertAppendPage(Relation index, Buffer *nbuf, Page *npage, GenericXLogState
 {
 	/* Add a new page */
 	LockRelationForExtension(index, ExclusiveLock);
+	if (hnsw_io_track)
+	{
+		hnsw_io_read_pages++;
+		hnsw_io_total_ios++;
+	}
 	*nbuf = HnswNewBuffer(index, MAIN_FORKNUM);
 	UnlockRelationForExtension(index, ExclusiveLock);
 
@@ -175,6 +190,11 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	/* Find a page (or two if needed) to insert the tuples */
 	for (;;)
 	{
+		if (hnsw_io_track)
+		{
+			hnsw_io_read_pages++;
+			hnsw_io_total_ios++;
+		}
 		buf = ReadBuffer(index, currentPage);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
@@ -326,11 +346,41 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	if (building)
 	{
 		MarkBufferDirty(buf);
+		hnsw_io_write_pages++;
+		if (HnswIOMarkPageUpdated(BufferGetBlockNumber(buf)))
+		{
+			hnsw_io_write_reason_counts[HNSW_WRITE_ADD_ELEMENT]++;
+			hnsw_io_updated_pages++;
+		}
+		hnsw_io_total_ios++;
 		if (nbuf != buf)
+		{
 			MarkBufferDirty(nbuf);
+			hnsw_io_write_pages++;
+			if (HnswIOMarkPageUpdated(BufferGetBlockNumber(nbuf)))
+			{
+				hnsw_io_write_reason_counts[HNSW_WRITE_ADD_ELEMENT]++;
+				hnsw_io_updated_pages++;
+			}
+			hnsw_io_total_ios++;
+		}
 	}
 	else
+	{
 		GenericXLogFinish(state);
+		hnsw_io_write_pages++;
+		if (HnswIOMarkPageUpdated(BufferGetBlockNumber(buf)))
+		{
+			hnsw_io_write_reason_counts[HNSW_WRITE_ADD_ELEMENT]++;
+			hnsw_io_updated_pages++;
+		}
+		if (nbuf != buf && HnswIOMarkPageUpdated(BufferGetBlockNumber(nbuf)))
+		{
+			hnsw_io_write_reason_counts[HNSW_WRITE_ADD_ELEMENT]++;
+			hnsw_io_updated_pages++;
+		}
+		hnsw_io_total_ios++;
+	}
 	UnlockReleaseBuffer(buf);
 	if (nbuf != buf)
 		UnlockReleaseBuffer(nbuf);
@@ -475,6 +525,11 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
 	OffsetNumber offno = element->neighborOffno;
 
 	/* Register page */
+	if (hnsw_io_track)
+	{
+		hnsw_io_read_pages++;
+		hnsw_io_total_ios++;
+	}
 	buf = ReadBuffer(index, element->neighborPage);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	if (building)
@@ -523,9 +578,27 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
 
 		/* Commit */
 		if (building)
+		{
 			MarkBufferDirty(buf);
+			hnsw_io_write_pages++;
+			if (HnswIOMarkPageUpdated(BufferGetBlockNumber(buf)))
+			{
+				hnsw_io_write_reason_counts[HNSW_WRITE_UPDATE_NEIGHBOR]++;
+				hnsw_io_updated_pages++;
+			}
+			hnsw_io_total_ios++;
+		}
 		else
+		{
 			GenericXLogFinish(state);
+			hnsw_io_write_pages++;
+			if (HnswIOMarkPageUpdated(BufferGetBlockNumber(buf)))
+			{
+				hnsw_io_write_reason_counts[HNSW_WRITE_UPDATE_NEIGHBOR]++;
+				hnsw_io_updated_pages++;
+			}
+			hnsw_io_total_ios++;
+		}
 	}
 	else if (!building)
 		GenericXLogAbort(state);
@@ -549,10 +622,15 @@ HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, 
 #endif
 													  128 * 1024);
 
+	/* Defensive reset: clean up stale layer state from prior ERROR */
+	hnsw_io_current_layer = -1;
+
 	for (int lc = e->level; lc >= 0; lc--)
 	{
 		int			lm = HnswGetLayerM(m, lc);
 		HnswNeighborArray *neighbors = HnswGetNeighbors(base, e, lc);
+
+		hnsw_io_current_layer = lc;
 
 		for (int i = 0; i < neighbors->length; i++)
 		{
@@ -570,6 +648,8 @@ HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, 
 		}
 	}
 
+	hnsw_io_current_layer = -1;
+
 	MemoryContextDelete(updateCtx);
 }
 
@@ -586,6 +666,11 @@ AddDuplicateOnDisk(Relation index, HnswElement element, HnswElement dup, bool bu
 	int			i;
 
 	/* Read page */
+	if (hnsw_io_track)
+	{
+		hnsw_io_read_pages++;
+		hnsw_io_total_ios++;
+	}
 	buf = ReadBuffer(index, dup->blkno);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	if (building)
@@ -621,9 +706,27 @@ AddDuplicateOnDisk(Relation index, HnswElement element, HnswElement dup, bool bu
 
 	/* Commit */
 	if (building)
+	{
 		MarkBufferDirty(buf);
+		hnsw_io_write_pages++;
+		if (HnswIOMarkPageUpdated(BufferGetBlockNumber(buf)))
+		{
+			hnsw_io_write_reason_counts[HNSW_WRITE_ADD_DUPLICATE]++;
+			hnsw_io_updated_pages++;
+		}
+		hnsw_io_total_ios++;
+	}
 	else
+	{
 		GenericXLogFinish(state);
+		hnsw_io_write_pages++;
+		if (HnswIOMarkPageUpdated(BufferGetBlockNumber(buf)))
+		{
+			hnsw_io_write_reason_counts[HNSW_WRITE_ADD_DUPLICATE]++;
+			hnsw_io_updated_pages++;
+		}
+		hnsw_io_total_ios++;
+	}
 	UnlockReleaseBuffer(buf);
 
 	return true;
@@ -673,14 +776,14 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
 
 	/* Update insert page if needed */
 	if (BlockNumberIsValid(newInsertPage))
-		HnswUpdateMetaPage(index, 0, NULL, newInsertPage, MAIN_FORKNUM, building);
+		HnswUpdateMetaPage(index, 0, NULL, newInsertPage, MAIN_FORKNUM, building, HNSW_WRITE_UPDATE_META_INSERT_PAGE);
 
 	/* Update neighbors */
 	HnswUpdateNeighborsOnDisk(index, support, element, m, false, building);
 
 	/* Update entry point if needed */
 	if (entryPoint == NULL || element->level > entryPoint->level)
-		HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM, building);
+		HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM, building, HNSW_WRITE_UPDATE_META_ENTRY_POINT);
 }
 
 /*
@@ -774,14 +877,25 @@ hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 	if (isnull[0])
 		return false;
 
+	/* Init page dedup set for this statement (persists across per-row calls) */
+	if (indexInfo->ii_AmCache == NULL)
+		indexInfo->ii_AmCache = palloc0(sizeof(HnswIOPageSet));
+	hnsw_io_page_set = (HnswIOPageSet *) indexInfo->ii_AmCache;
+
 	/* Create memory context */
 	insertCtx = AllocSetContextCreate(CurrentMemoryContext,
 									  "Hnsw insert temporary context",
 									  ALLOCSET_DEFAULT_SIZES);
 	oldCtx = MemoryContextSwitchTo(insertCtx);
 
+	/* Defensive reset: clean up stale state from prior ERROR */
+	hnsw_io_track = false;
+	hnsw_io_current_layer = -1;
+
 	/* Insert tuple */
+	hnsw_io_track = true;
 	HnswInsertTuple(index, values, isnull, heap_tid);
+	hnsw_io_track = false;
 
 	/* Delete memory context */
 	MemoryContextSwitchTo(oldCtx);

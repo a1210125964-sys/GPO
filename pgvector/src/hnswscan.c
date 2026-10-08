@@ -24,6 +24,10 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	char	   *base = NULL;
 	HnswQuery  *q = &so->q;
 
+	/* Defensive reset: clean up stale state from prior ERROR */
+	hnsw_io_current_layer = -1;
+	HnswTupleTraceStartQuery();
+
 	/* Get m and entry point */
 	HnswGetMetaPageInfo(index, &m, &entryPoint);
 
@@ -33,14 +37,17 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	if (entryPoint == NULL)
 		return NIL;
 
+	hnsw_io_current_layer = entryPoint->level;
 	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
 
 	for (int lc = entryPoint->level; lc >= 1; lc--)
 	{
+		hnsw_io_current_layer = lc;
 		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
 		ep = w;
 	}
 
+	hnsw_io_current_layer = 0;
 	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
 }
 
@@ -55,6 +62,9 @@ ResumeScanItems(IndexScanDesc scan)
 	List	   *ep = NIL;
 	char	   *base = NULL;
 	int			batch_size = hnsw_ef_search;
+
+	/* Defensive reset: clean up stale layer state from prior ERROR */
+	hnsw_io_current_layer = -1;
 
 	if (pairingheap_is_empty(so->discarded))
 		return NIL;
@@ -72,6 +82,7 @@ ResumeScanItems(IndexScanDesc scan)
 		ep = lappend(ep, sc);
 	}
 
+	hnsw_io_current_layer = 0;
 	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples);
 }
 
@@ -191,6 +202,10 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 	{
 		Datum		value;
 
+		/* Defensive reset: clean up stale state from prior ERROR (H3) */
+		hnsw_io_track = false;
+		hnsw_io_current_layer = -1;
+
 		/* Count index scan for stats */
 		pgstat_count_index_scan(scan->indexRelation);
 
@@ -212,11 +227,15 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		 */
 		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
+		hnsw_io_track = true;
 		so->w = GetScanItems(scan, value);
 
 		/* Release shared lock */
 		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
+		/* Clean up layer context and tracking flag (H4) */
+		hnsw_io_current_layer = -1;
+		hnsw_io_track = false;
 		so->first = false;
 
 #if defined(HNSW_MEMORY)
@@ -262,9 +281,16 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 				 */
 				LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
+				/* Defensive reset: clean up stale state from prior ERROR */
+				hnsw_io_track = false;
+				hnsw_io_current_layer = -1;
+				hnsw_io_track = true;
 				so->w = ResumeScanItems(scan);
 
 				UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+				hnsw_io_current_layer = -1;
+				hnsw_io_track = false;
 
 #if defined(HNSW_MEMORY)
 				ShowMemoryUsage(so);

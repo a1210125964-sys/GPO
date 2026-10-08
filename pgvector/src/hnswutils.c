@@ -296,6 +296,11 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	Page		page;
 	HnswMetaPage metap;
 
+	if (hnsw_io_track)
+	{
+		hnsw_io_read_pages++;
+		hnsw_io_total_ios++;
+	}
 	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
@@ -366,12 +371,17 @@ HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, Block
  * Update the metapage
  */
 void
-HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building)
+HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building, HnswWriteReason reason)
 {
 	Buffer		buf;
 	Page		page;
 	GenericXLogState *state;
 
+	if (hnsw_io_track)
+	{
+		hnsw_io_read_pages++;
+		hnsw_io_total_ios++;
+	}
 	buf = ReadBufferExtended(index, forkNum, HNSW_METAPAGE_BLKNO, RBM_NORMAL, NULL);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	if (building)
@@ -388,9 +398,33 @@ HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, Bloc
 	HnswUpdateMetaPageInfo(page, updateEntry, entryPoint, insertPage);
 
 	if (building)
+	{
 		MarkBufferDirty(buf);
+		if (hnsw_io_track)
+		{
+			hnsw_io_write_pages++;
+			if (HnswIOMarkPageUpdated(BufferGetBlockNumber(buf)))
+			{
+				hnsw_io_write_reason_counts[reason]++;
+				hnsw_io_updated_pages++;
+			}
+			hnsw_io_total_ios++;
+		}
+	}
 	else
+	{
 		GenericXLogFinish(state);
+		if (hnsw_io_track)
+		{
+			hnsw_io_write_pages++;
+			if (HnswIOMarkPageUpdated(BufferGetBlockNumber(buf)))
+			{
+				hnsw_io_write_reason_counts[reason]++;
+				hnsw_io_updated_pages++;
+			}
+			hnsw_io_total_ios++;
+		}
+	}
 	UnlockReleaseBuffer(buf);
 }
 
@@ -531,14 +565,21 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	Page		page;
 	HnswElementTuple etup;
 
-	/* Read vector */
+	int64		io_before = 0;
+
+	/* Read vector — per-layer IO tracking */
+	if (hnsw_io_track)
+		HnswIOCountLayerReadBegin(&io_before);
 	buf = ReadBuffer(index, blkno);
+	if (hnsw_io_track)
+		HnswIOCountLayerReadEnd(io_before);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
 	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
 
 	Assert(HnswIsElementTuple(etup));
+	HnswTupleTraceRecord(blkno, offno, "element", hnsw_io_current_layer);
 
 	/* Calculate distance */
 	if (distance != NULL)
@@ -755,11 +796,20 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 	HnswNeighborTuple ntup;
 	int			start;
 
+	int64		io_before = 0;
+
+	/* Per-layer IO tracking */
+	if (hnsw_io_track)
+		HnswIOCountLayerReadBegin(&io_before);
 	buf = ReadBuffer(index, element->neighborPage);
+	if (hnsw_io_track)
+		HnswIOCountLayerReadEnd(io_before);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
 	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, element->neighborOffno));
+	HnswTupleTraceRecord(element->neighborPage, element->neighborOffno,
+						 "neighbor", lc);
 
 	/*
 	 * Ensure the neighbor tuple has not been deleted or replaced between
@@ -1278,6 +1328,9 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	HnswElement skipElement = existing ? element : NULL;
 	bool		inMemory = index == NULL;
 
+	/* Defensive reset: clean up any stale layer state from prior ERROR */
+	hnsw_io_current_layer = -1;
+
 	q.value = HnswGetValue(base, element);
 
 	/* Precompute hash */
@@ -1286,15 +1339,20 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 
 	/* No neighbors if no entry point */
 	if (entryPoint == NULL)
+	{
+		hnsw_io_current_layer = -1;
 		return;
+	}
 
 	/* Get entry point and level */
-	ep = list_make1(HnswEntryCandidate(base, entryPoint, &q, index, support, true));
 	entryLevel = entryPoint->level;
+	hnsw_io_current_layer = entryLevel;
+	ep = list_make1(HnswEntryCandidate(base, entryPoint, &q, index, support, true));
 
 	/* 1st phase: greedy search to insert level */
 	for (int lc = entryLevel; lc >= level + 1; lc--)
 	{
+		hnsw_io_current_layer = lc;
 		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
 		ep = w;
 	}
@@ -1314,6 +1372,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		List	   *lw = NIL;
 		ListCell   *lc2;
 
+		hnsw_io_current_layer = lc;
 		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
 
 		/* Convert search candidates to candidates */
@@ -1344,6 +1403,8 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 
 		ep = w;
 	}
+
+	hnsw_io_current_layer = -1;
 }
 
 PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);

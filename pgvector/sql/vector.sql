@@ -916,3 +916,54 @@ CREATE OPERATOR CLASS sparsevec_l1_ops
 	OPERATOR 1 <+> (sparsevec, sparsevec) FOR ORDER BY float_ops,
 	FUNCTION 1 l1_distance(sparsevec, sparsevec),
 	FUNCTION 3 hnsw_sparsevec_support(internal);
+
+-- hnsw I/O statistics functions
+
+CREATE FUNCTION hnsw_io_stats(OUT read_pages bigint, OUT write_pages bigint, OUT total_ios bigint, OUT updated_pages bigint)
+	AS 'MODULE_PATHNAME', 'hnsw_io_stats' LANGUAGE C STABLE PARALLEL RESTRICTED;
+
+CREATE FUNCTION hnsw_io_stats_reset()
+	RETURNS void
+	AS 'MODULE_PATHNAME', 'hnsw_io_stats_reset' LANGUAGE C VOLATILE PARALLEL RESTRICTED;
+
+-- hnsw write reason breakdown
+CREATE TYPE hnsw_io_write_reasons_type AS (
+	add_element bigint,
+	update_neighbor bigint,
+	update_meta_insert_page bigint,
+	update_meta_entry_point bigint,
+	add_duplicate bigint
+);
+
+CREATE FUNCTION hnsw_io_write_reasons()
+	RETURNS hnsw_io_write_reasons_type
+	AS 'MODULE_PATHNAME', 'hnsw_io_write_reasons'
+	LANGUAGE C STABLE PARALLEL RESTRICTED;
+
+-- hnsw per-layer read page statistics
+-- Only layers with non-zero counts are returned.
+-- io_read_pages:  actual physical disk reads (cache misses) at this layer
+-- buffer_read_pages: all ReadBuffer() calls at this layer (including cache hits)
+-- Invariant: io_read_pages <= buffer_read_pages for every row
+-- The ratio (buffer - io) / buffer is the cache hit rate for this layer.
+CREATE TYPE hnsw_io_layer_stats_type AS (
+	layer smallint,
+	io_read_pages bigint,
+	buffer_read_pages bigint
+);
+
+CREATE FUNCTION hnsw_io_layer_stats()
+	RETURNS SETOF hnsw_io_layer_stats_type
+	AS 'MODULE_PATHNAME', 'hnsw_io_layer_stats'
+	LANGUAGE C STABLE PARALLEL RESTRICTED;
+
+COMMENT ON FUNCTION hnsw_io_layer_stats() IS
+'Returns per-layer HNSW read page statistics.
+Columns: layer (HNSW layer number, 0 = ground layer),
+io_read_pages (physical disk reads at this layer — cache misses),
+buffer_read_pages (total ReadBuffer calls at this layer, including cache hits).
+Only layers with non-zero counts are returned.
+When hnsw.io_layer_track = off, this function returns zero rows
+(per-layer counting is disabled; global hnsw_io_stats() counters
+continue to increment normally).
+Cache hit rate per layer = (buffer_read_pages - io_read_pages) / buffer_read_pages.';

@@ -228,7 +228,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 	UnlockReleaseBuffer(buf);
 
 	entryPoint = HnswPtrAccess(base, buildstate->graph->entryPoint);
-	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint, insertPage, forkNum, true);
+	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint, insertPage, forkNum, true, HNSW_WRITE_UPDATE_META_ENTRY_POINT);
 
 	pfree(etup);
 	pfree(ntup);
@@ -773,6 +773,11 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
 	/* Join parallel scan */
 	indexInfo = BuildIndexInfo(indexRel);
 	indexInfo->ii_Concurrent = hnswshared->isconcurrent;
+
+	/* Init page dedup set for this parallel worker */
+	indexInfo->ii_AmCache = palloc0(sizeof(HnswIOPageSet));
+	hnsw_io_page_set = (HnswIOPageSet *) indexInfo->ii_AmCache;
+
 	InitBuildState(&buildstate, heapRel, indexRel, indexInfo, MAIN_FORKNUM);
 	buildstate.graph = &hnswshared->graphData;
 	buildstate.hnswarea = hnswarea;
@@ -798,6 +803,7 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
 	/* Notify leader */
 	ConditionVariableSignal(&hnswshared->workersdonecv);
 
+	hnsw_io_page_set = NULL;
 	FreeBuildState(&buildstate);
 }
 
@@ -1119,7 +1125,12 @@ hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	IndexBuildResult *result;
 	HnswBuildState buildstate;
 
+	/* Init page dedup set for this build */
+	hnsw_io_page_set = palloc0(sizeof(HnswIOPageSet));
+
 	BuildIndex(heap, index, indexInfo, &buildstate, MAIN_FORKNUM);
+
+	hnsw_io_page_set = NULL;
 
 	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
 	result->heap_tuples = buildstate.reltuples;
@@ -1137,5 +1148,10 @@ hnswbuildempty(Relation index)
 	IndexInfo  *indexInfo = BuildIndexInfo(index);
 	HnswBuildState buildstate;
 
+	/* Init page dedup set for this build */
+	hnsw_io_page_set = palloc0(sizeof(HnswIOPageSet));
+
 	BuildIndex(NULL, index, indexInfo, &buildstate, INIT_FORKNUM);
+
+	hnsw_io_page_set = NULL;
 }
